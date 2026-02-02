@@ -1,0 +1,72 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paylinks_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: 8787
+      HOST: 0.0.0.0
+      DATABASE_URL: postgres://paylinks:${POSTGRES_PASSWORD}@db:5432/paylinks
+      PAYLINKS_MASTER_KEY_B64: ${PAYLINKS_MASTER_KEY_B64}
+      PAYLINKS_FINGERPRINT_KEY: ${PAYLINKS_FINGERPRINT_KEY}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:8787:8787"
+    networks:
+      - paylinks_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  db:
+    image: postgres:16-alpine
+    container_name: paylinks_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: paylinks
+      POSTGRES_USER: paylinks
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - paylinks_db:/var/lib/postgresql/data
+    networks:
+      - paylinks_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paylinks -d paylinks"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # DB not exposed to host - only accessible within Docker network
+
+  # Run migrations (one-off container)
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paylinks_migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://paylinks:${POSTGRES_PASSWORD}@db:5432/paylinks
+    command: ["npx", "node-pg-migrate", "up", "-m", "migrations"]
+    networks:
+      - paylinks_net
+    profiles:
+      - migrate
+
+networks:
+  paylinks_net:
+    driver: bridge
+
+volumes:
+  paylinks_db:
