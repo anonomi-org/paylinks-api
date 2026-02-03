@@ -25,6 +25,18 @@ function getAllowedOrigins(): string[] | true {
   return env.split(",").map((o) => o.trim()).filter(Boolean);
 }
 
+function getDonateBaseUrl(): string {
+  const env = process.env.DONATE_BASE_URL;
+  if (!env) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("DONATE_BASE_URL must be set in production");
+    }
+    return "https://anonomi.org/paylinks/d#"; // Default for development
+  }
+  // Ensure it ends with # for the fragment identifier
+  return env.endsWith("#") ? env : `${env}#`;
+}
+
 // --- Schemas ---
 const PaylinkOptionsSchema = z
   .object({
@@ -343,7 +355,7 @@ async function main() {
 
       await client.query("COMMIT");
 
-      const donateUrl = `https://anonomi.org/paylinks/d#${id}`;
+      const donateUrl = `${getDonateBaseUrl()}${id}`;
       const embedHtml =
         `<!-- Anonomi Paylinks -->\n` +
         `<a href="${donateUrl}" rel="nofollow noopener" target="_blank">Donate XMR</a>\n`;

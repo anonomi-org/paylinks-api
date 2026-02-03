@@ -17,7 +17,7 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       NODE_ENV: production
     ports:
-      - "127.0.0.1:8787:8787"
+      - "${BIND_ADDRESS:-127.0.0.1}:8787:8787"
     networks:
       - paylinks_net
     healthcheck:
