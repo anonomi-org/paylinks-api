@@ -65,6 +65,8 @@ const DeleteByOwnerKeySchema = z.object({
     .regex(/^[0-9a-f]{64}$/i, "ownerKey must be 64 hex chars"),
 });
 
+const PaylinkIdSchema = z.string().uuid();
+
 function clampIndex(n: number) {
   return Math.max(1, Math.min(n, MAX_SUBADDRESS_INDEX));
 }
@@ -117,6 +119,9 @@ function genericDeleteMessageBulk() {
   return "If any existed, all paylinks associated with the provided owner key were deleted.";
 }
 
+// Generic error that doesn't reveal if paylink exists, is inactive, or deleted
+const PAYLINK_UNAVAILABLE_ERROR = { error: "paylink_unavailable" } as const;
+
 async function uniformDelay() {
   
   const ms = 150 + crypto.randomInt(0, 120);
@@ -148,9 +153,14 @@ async function main() {
   app.get("/health", async () => ({ ok: true }));
 
   // PUBLIC METADATA (used by donation page on load)
-  // Returns label + fingerprint 
+  // Returns label + fingerprint
   app.get("/api/paylinks/:id/meta", async (req, reply) => {
-    const id = (req.params as any)?.id as string;
+    const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
+    if (!idResult.success) {
+      await uniformDelay();
+      return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+    }
+    const id = idResult.data;
 
     const client = await pool.connect();
     try {
@@ -168,16 +178,13 @@ async function main() {
         [id],
       );
 
-      if (r.rowCount !== 1) {
-        return reply.code(404).send({ error: "paylink_not_found" });
+      // Same response for not found, inactive, or deleted - no info leakage
+      if (r.rowCount !== 1 || !r.rows[0]!.active || r.rows[0]!.deleted_at) {
+        await uniformDelay();
+        return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
       const row = r.rows[0]!;
-      if (!row.active)
-        return reply.code(410).send({ error: "paylink_inactive" });
-      if (row.deleted_at)
-        return reply.code(410).send({ error: "paylink_deleted" });
-
       const fingerprint = computePaylinkFingerprint(id);
 
       return reply.code(200).send({
@@ -365,7 +372,16 @@ async function main() {
 
   // DELETE ONE (hard delete by id + ownerKey)
   app.post("/api/paylinks/:id/delete", async (req, reply) => {
-    const id = (req.params as any)?.id as string;
+    const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
+    if (!idResult.success) {
+      await uniformDelay();
+      // Same response as success - no info leakage about ID validity
+      return reply.code(200).send({
+        ok: true,
+        message: genericDeleteMessageSingle((req.params as any)?.id ?? ""),
+      });
+    }
+    const id = idResult.data;
 
     const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -391,7 +407,7 @@ async function main() {
 
       await client.query("COMMIT");
 
-      // Random delay before responding, so that timing differences don’t leak information.
+      // Random delay before responding, so that timing differences don't leak information.
       await uniformDelay();
 
       // Always 200, never indicates if it existed or matched
@@ -450,7 +466,12 @@ async function main() {
 
   // Donor requests a payment payload (random index each time)
   app.post("/api/paylinks/:id/request", async (req, reply) => {
-    const id = (req.params as any)?.id as string;
+    const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
+    if (!idResult.success) {
+      await uniformDelay();
+      return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+    }
+    const id = idResult.data;
 
     const parsed = RequestDonationSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -492,15 +513,13 @@ async function main() {
         [id],
       );
 
-      if (paylinkRes.rowCount !== 1) {
-        return reply.code(404).send({ error: "paylink_not_found" });
+      // Same response for not found, inactive, or deleted - no info leakage
+      if (paylinkRes.rowCount !== 1 || !paylinkRes.rows[0]!.active || paylinkRes.rows[0]!.deleted_at) {
+        await uniformDelay();
+        return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
       const paylink = paylinkRes.rows[0]!;
-      if (!paylink.active)
-        return reply.code(410).send({ error: "paylink_inactive" });
-      if (paylink.deleted_at)
-        return reply.code(410).send({ error: "paylink_deleted" });
 
       // DB enforces these, but clamp anyway
       const safeLo = clampIndex(paylink.min_index);
