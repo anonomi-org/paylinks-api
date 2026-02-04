@@ -159,7 +159,30 @@ async function main() {
     disableRequestLogging: false,
   });
 
-  await app.register(cors, { origin: getAllowedOrigins(), methods: ["GET", "POST"] });
+  // CORS configuration
+  const allowedOrigins = getAllowedOrigins();
+  const allowNullOrigin = process.env.ALLOW_NULL_ORIGIN === "true";
+
+  await app.register(cors, {
+    origin: (origin, cb) => {
+      // Tor Browser sends "null" as origin for privacy
+      // Only allow if ALLOW_NULL_ORIGIN=true (for Tor deployments)
+      if ((origin === null || origin === "null") && allowNullOrigin) {
+        return cb(null, "*");
+      }
+      // In development, allow all origins
+      if (allowedOrigins === true) {
+        return cb(null, true);
+      }
+      // Check against allowed origins list
+      if (origin && allowedOrigins.includes(origin)) {
+        return cb(null, origin);
+      }
+      // Origin not allowed
+      return cb(null, false);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+  });
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
 
   app.get("/health", async () => ({ ok: true }));
