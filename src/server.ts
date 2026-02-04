@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { z } from "zod";
@@ -62,8 +63,9 @@ const RequestDonationSchema = z.object({
     },
     z
       .string()
-      .max(40)
-      .regex(/^\d+(\.\d+)?$/, "amount must be a number")
+      .max(30)
+      // Max 15 whole digits, max 12 decimal places (Monero has 12 decimal places)
+      .regex(/^\d{1,15}(\.\d{1,12})?$/, "invalid amount format")
       .optional(),
   ),
   description: z.string().trim().max(140).optional().default(""),
@@ -134,10 +136,21 @@ function genericDeleteMessageBulk() {
 // Generic error that doesn't reveal if paylink exists, is inactive, or deleted
 const PAYLINK_UNAVAILABLE_ERROR = { error: "paylink_unavailable" } as const;
 
-async function uniformDelay() {
-  
-  const ms = 150 + crypto.randomInt(0, 120);
-  await new Promise((r) => setTimeout(r, ms));
+// Minimum response time to prevent timing attacks
+// Ensures total response time is at least minMs, with jitter
+const MIN_RESPONSE_TIME_MS = 200;
+
+async function ensureMinimumTime<T>(
+  startTime: number,
+  result: T,
+): Promise<T> {
+  const elapsed = Date.now() - startTime;
+  if (elapsed < MIN_RESPONSE_TIME_MS) {
+    // Add remaining time plus random jitter (0-100ms)
+    const remaining = MIN_RESPONSE_TIME_MS - elapsed + crypto.randomInt(0, 100);
+    await new Promise((r) => setTimeout(r, remaining));
+  }
+  return result;
 }
 
 function computeOwnerKey(publicAddress: string, privateViewKey: string) {
@@ -152,16 +165,41 @@ async function main() {
     logger: {
       level: "info",
       redact: {
-        paths: ["req.body.ownerKey", "req.body.privateViewKey"],
+        paths: [
+          "req.body.ownerKey",
+          "req.body.privateViewKey",
+          "req.body.publicAddress",
+        ],
         remove: true,
       },
     },
     disableRequestLogging: false,
+    bodyLimit: 16384, // 16KB max body size
   });
 
   // CORS configuration
   const allowedOrigins = getAllowedOrigins();
   const allowNullOrigin = process.env.ALLOW_NULL_ORIGIN === "true";
+
+  // Security headers - configured for JSON API (not HTML)
+  // Disabled headers that can interfere with CORS/Tor
+  // HSTS disabled for Tor deployments (.onion uses HTTP, Tor provides encryption)
+  const enableHsts =
+    process.env.NODE_ENV === "production" && !allowNullOrigin;
+
+  await app.register(helmet, {
+    contentSecurityPolicy: false, // API doesn't serve HTML
+    crossOriginEmbedderPolicy: false, // Can interfere with CORS
+    crossOriginOpenerPolicy: false, // Not relevant for API
+    crossOriginResourcePolicy: false, // Let CORS handle this
+    originAgentCluster: false, // Not relevant for API
+    dnsPrefetchControl: { allow: false },
+    frameguard: { action: "deny" },
+    hsts: enableHsts ? { maxAge: 31536000 } : false,
+    noSniff: true,
+    referrerPolicy: { policy: "no-referrer" },
+    xssFilter: true,
+  });
 
   await app.register(cors, {
     origin: (origin, cb) => {
@@ -183,6 +221,8 @@ async function main() {
     },
     methods: ["GET", "POST", "OPTIONS"],
   });
+
+  // Global rate limit
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
 
   app.get("/health", async () => ({ ok: true }));
@@ -190,9 +230,11 @@ async function main() {
   // PUBLIC METADATA (used by donation page on load)
   // Returns label + fingerprint
   app.get("/api/paylinks/:id/meta", async (req, reply) => {
+    const startTime = Date.now();
+
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await uniformDelay();
+      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
@@ -215,7 +257,7 @@ async function main() {
 
       // Same response for not found, inactive, or deleted - no info leakage
       if (r.rowCount !== 1 || !r.rows[0]!.active || r.rows[0]!.deleted_at) {
-        await uniformDelay();
+        await ensureMinimumTime(startTime, null);
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
@@ -407,9 +449,11 @@ async function main() {
 
   // DELETE ONE (hard delete by id + ownerKey)
   app.post("/api/paylinks/:id/delete", async (req, reply) => {
+    const startTime = Date.now();
+
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await uniformDelay();
+      await ensureMinimumTime(startTime, null);
       // Same response as success - no info leakage about ID validity
       return reply.code(200).send({
         ok: true,
@@ -442,8 +486,8 @@ async function main() {
 
       await client.query("COMMIT");
 
-      // Random delay before responding, so that timing differences don't leak information.
-      await uniformDelay();
+      // Ensure minimum response time to prevent timing attacks
+      await ensureMinimumTime(startTime, null);
 
       // Always 200, never indicates if it existed or matched
       return reply.code(200).send({
@@ -461,6 +505,8 @@ async function main() {
   });
 
   app.post("/api/paylinks/delete", async (req, reply) => {
+    const startTime = Date.now();
+
     const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply
@@ -484,7 +530,7 @@ async function main() {
 
       await client.query("COMMIT");
 
-      await uniformDelay();
+      await ensureMinimumTime(startTime, null);
 
       return reply.code(200).send({
         ok: true,
@@ -501,9 +547,11 @@ async function main() {
 
   // Donor requests a payment payload (random index each time)
   app.post("/api/paylinks/:id/request", async (req, reply) => {
+    const startTime = Date.now();
+
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await uniformDelay();
+      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
@@ -550,7 +598,7 @@ async function main() {
 
       // Same response for not found, inactive, or deleted - no info leakage
       if (paylinkRes.rowCount !== 1 || !paylinkRes.rows[0]!.active || paylinkRes.rows[0]!.deleted_at) {
-        await uniformDelay();
+        await ensureMinimumTime(startTime, null);
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
