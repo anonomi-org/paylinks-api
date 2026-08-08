@@ -8,11 +8,10 @@ import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { z } from "zod";
 import { pool } from "./db";
-import { encryptViewKey, decryptViewKey } from "./crypto";
 import { buildMoneroUri } from "./moneroUri";
 import {
   assertValidPrimaryAddressAndViewKey,
-  deriveSubaddress,
+  deriveSubaddressRange,
   warmup as warmupMoneroAddressing,
 } from "./monero/address";
 import crypto from "crypto";
@@ -20,6 +19,13 @@ import crypto from "crypto";
 const MAX_SUBADDRESS_INDEX = 1_000_000;
 const DEFAULT_MIN_INDEX = 1;
 const DEFAULT_MAX_INDEX = 100;
+
+// How many addresses a single paylink may reserve. Subaddresses are derived up
+// front so the view key never has to be stored, which turns the index range
+// into real work and storage: roughly 0.4ms and 95 bytes per address, so a
+// thousand costs about 400ms and 93KB. The donate page requests exactly one
+// address per visit, so this is a generous ceiling rather than a tight one.
+const MAX_POOL_SIZE = 1_000;
 
 function getAllowedOrigins(): string[] | true {
   const env = process.env.ALLOWED_ORIGINS;
@@ -431,22 +437,39 @@ async function main() {
     const minIndex = clampIndex(lo);
     const maxIndex = clampIndex(hi);
 
-    // Compute preview so the user can sanity-check in their wallet UI
-    let addressPreview: string | null = null;
+    // Every subaddress is derived up front, so the range is also the amount of
+    // work and storage a single request can ask for. The indices themselves may
+    // still be large; it is the count that has to stay bounded.
+    const poolSize = maxIndex - minIndex + 1;
+    if (poolSize > MAX_POOL_SIZE) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: {
+          options: {
+            maxIndex: [
+              `minIndex and maxIndex may span at most ${MAX_POOL_SIZE} addresses (requested ${poolSize})`,
+            ],
+          },
+        },
+      });
+    }
 
+    // Derive the whole pool now, while the view key is in hand. After this
+    // request the key is gone - it is never written to the database, so a
+    // compromise of this service cannot reconstruct anybody's payment history.
+    let subaddresses: { index: number; address: string }[];
     try {
       // Rejects a bad checksum, a subaddress, the wrong network, a malleated
       // encoding, and - the one that used to lose money silently - a view key
       // that does not belong to this address.
       await assertValidPrimaryAddressAndViewKey(publicAddress, privateViewKey);
 
-      const addrAtMin = await deriveSubaddress(
+      subaddresses = await deriveSubaddressRange(
         publicAddress,
         privateViewKey,
         minIndex,
+        maxIndex,
       );
-
-      addressPreview = previewAddr(addrAtMin);
     } catch {
       return reply.code(400).send({
         error: "invalid_request",
@@ -458,7 +481,8 @@ async function main() {
       });
     }
 
-    const { ciphertextB64, nonceB64 } = encryptViewKey(privateViewKey);
+    // Preview so the user can sanity-check the first address in their wallet.
+    const addressPreview = previewAddr(subaddresses[0]!.address);
 
     const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
 
@@ -471,30 +495,34 @@ async function main() {
         INSERT INTO paylinks (
           label,
           public_address,
-          encrypted_view_key,
-          encryption_nonce,
           gen_mode,
           min_index,
           max_index,
           owner_key
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        VALUES ($1,$2,$3,$4,$5,$6)
         RETURNING id
         `,
-        [
-          label,
-          publicAddress,
-          ciphertextB64,
-          nonceB64,
-          genMode,
-          minIndex,
-          maxIndex,
-          ownerKey,
-        ],
+        [label, publicAddress, genMode, minIndex, maxIndex, ownerKey],
       );
 
       const id = insertRes.rows[0]?.id;
       if (!id) throw new Error("Failed to create paylink");
+
+      // One statement for the whole pool. unnest keeps this to three bound
+      // parameters instead of three per address.
+      await client.query(
+        `
+        INSERT INTO paylink_subaddresses (paylink_id, subaddress_index, address)
+        SELECT $1, idx, addr
+        FROM unnest($2::int[], $3::text[]) AS t(idx, addr)
+        `,
+        [
+          id,
+          subaddresses.map((s) => s.index),
+          subaddresses.map((s) => s.address),
+        ],
+      );
 
       await client.query("COMMIT");
 
@@ -635,9 +663,6 @@ async function main() {
     try {
       const paylinkRes = await client.query<{
         label: string;
-        public_address: string;
-        encrypted_view_key: string;
-        encryption_nonce: string;
         active: boolean;
         deleted_at: string | null;
         gen_mode: string;
@@ -647,9 +672,6 @@ async function main() {
         `
         SELECT
           label,
-          public_address,
-          encrypted_view_key,
-          encryption_nonce,
           active,
           deleted_at,
           gen_mode,
@@ -677,20 +699,29 @@ async function main() {
 
       const index = crypto.randomInt(lo, hi + 1);
 
-      const viewKey = decryptViewKey(
-        paylink.encrypted_view_key,
-        paylink.encryption_nonce,
+      // The pool was derived and stored at creation time, so serving a donation
+      // is a primary-key lookup and this service holds no key material at all.
+      const addressRes = await client.query<{ address: string }>(
+        `
+        SELECT address
+        FROM paylink_subaddresses
+        WHERE paylink_id = $1 AND subaddress_index = $2
+        LIMIT 1
+        `,
+        [id, index],
       );
 
-      // Rows created before address validation existed may hold a mismatched
-      // address/view-key pair. Those now throw into the handler's catch and
-      // surface as an error instead of quietly handing the donor an address
-      // that nobody can spend from.
-      const address = await deriveSubaddress(
-        paylink.public_address,
-        viewKey,
-        index,
-      );
+      const address = addressRes.rows[0]?.address;
+      if (!address) {
+        // The row's stored range disagrees with the pool that was written for
+        // it, so the paylink cannot be served. Same opaque answer as a missing
+        // paylink rather than a distinguishable error.
+        req.log.error(
+          { subaddressIndex: index },
+          "paylink has no address at the requested index",
+        );
+        return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+      }
 
       const uri = buildMoneroUri({
         address,
