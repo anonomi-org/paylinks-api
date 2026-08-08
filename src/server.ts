@@ -10,6 +10,15 @@ import { z } from "zod";
 import { pool } from "./db";
 import { buildMoneroUri } from "./moneroUri";
 import {
+  deletePaylinkByIdAndOwner,
+  deletePaylinksByOwner,
+  findPaylinkForRequest,
+  findPaylinkMeta,
+  findSubaddress,
+  insertPaylink,
+  insertSubaddresses,
+} from "./store";
+import {
   assertValidPrimaryAddressAndViewKey,
   deriveSubaddressRange,
   warmup as warmupMoneroAddressing,
@@ -320,26 +329,13 @@ async function main() {
 
     const client = await pool.connect();
     try {
-      const r = await client.query<{
-        label: string | null;
-        active: boolean;
-        deleted_at: string | null;
-      }>(
-        `
-      SELECT label, active, deleted_at
-      FROM paylinks
-      WHERE id = $1
-      LIMIT 1
-      `,
-        [id],
-      );
+      const row = await findPaylinkMeta(client, id);
 
       // Same response for not found, inactive, or deleted - no info leakage
-      if (r.rowCount !== 1 || !r.rows[0]!.active || r.rows[0]!.deleted_at) {
+      if (!row || !row.active || row.deleted_at) {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
-      const row = r.rows[0]!;
       const fingerprint = computePaylinkFingerprint(id);
 
       return reply.code(200).send({
@@ -490,39 +486,16 @@ async function main() {
     try {
       await client.query("BEGIN");
 
-      const insertRes = await client.query<{ id: string }>(
-        `
-        INSERT INTO paylinks (
-          label,
-          public_address,
-          gen_mode,
-          min_index,
-          max_index,
-          owner_key
-        )
-        VALUES ($1,$2,$3,$4,$5,$6)
-        RETURNING id
-        `,
-        [label, publicAddress, genMode, minIndex, maxIndex, ownerKey],
-      );
+      const id = await insertPaylink(client, {
+        label,
+        publicAddress,
+        genMode,
+        minIndex,
+        maxIndex,
+        ownerKey,
+      });
 
-      const id = insertRes.rows[0]?.id;
-      if (!id) throw new Error("Failed to create paylink");
-
-      // One statement for the whole pool. unnest keeps this to three bound
-      // parameters instead of three per address.
-      await client.query(
-        `
-        INSERT INTO paylink_subaddresses (paylink_id, subaddress_index, address)
-        SELECT $1, idx, addr
-        FROM unnest($2::int[], $3::text[]) AS t(idx, addr)
-        `,
-        [
-          id,
-          subaddresses.map((s) => s.index),
-          subaddresses.map((s) => s.address),
-        ],
-      );
+      await insertSubaddresses(client, id, subaddresses);
 
       await client.query("COMMIT");
 
@@ -579,13 +552,7 @@ async function main() {
       await client.query("BEGIN");
 
       // Only deletes if BOTH match.
-      await client.query(
-        `
-      DELETE FROM paylinks
-      WHERE id = $1 AND owner_key = $2
-      `,
-        [id, ownerKey],
-      );
+      await deletePaylinkByIdAndOwner(client, id, ownerKey);
 
       await client.query("COMMIT");
 
@@ -618,13 +585,7 @@ async function main() {
     try {
       await client.query("BEGIN");
 
-      await client.query(
-        `
-      DELETE FROM paylinks
-      WHERE owner_key = $1
-      `,
-        [ownerKey],
-      );
+      await deletePaylinksByOwner(client, ownerKey);
 
       await client.query("COMMIT");
 
@@ -661,35 +622,12 @@ async function main() {
 
     const client = await pool.connect();
     try {
-      const paylinkRes = await client.query<{
-        label: string;
-        active: boolean;
-        deleted_at: string | null;
-        gen_mode: string;
-        min_index: number;
-        max_index: number;
-      }>(
-        `
-        SELECT
-          label,
-          active,
-          deleted_at,
-          gen_mode,
-          min_index,
-          max_index
-        FROM paylinks
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [id],
-      );
+      const paylink = await findPaylinkForRequest(client, id);
 
       // Same response for not found, inactive, or deleted - no info leakage
-      if (paylinkRes.rowCount !== 1 || !paylinkRes.rows[0]!.active || paylinkRes.rows[0]!.deleted_at) {
+      if (!paylink || !paylink.active || paylink.deleted_at) {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
-
-      const paylink = paylinkRes.rows[0]!;
 
       // DB enforces these, but clamp anyway
       const safeLo = clampIndex(paylink.min_index);
@@ -701,17 +639,7 @@ async function main() {
 
       // The pool was derived and stored at creation time, so serving a donation
       // is a primary-key lookup and this service holds no key material at all.
-      const addressRes = await client.query<{ address: string }>(
-        `
-        SELECT address
-        FROM paylink_subaddresses
-        WHERE paylink_id = $1 AND subaddress_index = $2
-        LIMIT 1
-        `,
-        [id, index],
-      );
-
-      const address = addressRes.rows[0]?.address;
+      const address = await findSubaddress(client, id, index);
       if (!address) {
         // The row's stored range disagrees with the pool that was written for
         // it, so the paylink cannot be served. Same opaque answer as a missing

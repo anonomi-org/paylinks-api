@@ -1,0 +1,54 @@
+// An in-process Postgres for the tests.
+//
+// PGlite is real Postgres compiled to WASM, so the migrations and queries run
+// against the actual engine rather than an emulator - no daemon, no container,
+// nothing to install beyond a devDependency. That matters because the schema
+// carries real behaviour we depend on: the check constraints, and the foreign
+// key that drops a paylink's address pool when the paylink goes.
+
+import path from "node:path";
+
+import type { Queryable } from "../../src/store";
+
+const MIGRATIONS_DIR = path.resolve(__dirname, "../../migrations");
+
+export type TestDb = Queryable & {
+  close: () => Promise<void>;
+};
+
+/** A fresh, fully migrated database. Each call is completely isolated. */
+export async function createTestDb(): Promise<TestDb> {
+  // Both packages are ESM-only and this file is CommonJS, so they are pulled
+  // in dynamically rather than with a top-level import.
+  const { PGlite } = await import("@electric-sql/pglite");
+  const { pgcrypto } = await import("@electric-sql/pglite/contrib/pgcrypto");
+  const { runner } = await import("node-pg-migrate");
+
+  const pg = new PGlite({ extensions: { pgcrypto } });
+  await pg.waitReady;
+
+  // node-pg-migrate drives a pg-shaped client; PGlite's query() is close
+  // enough that this thin adapter is all it needs.
+  const dbClient: any = {
+    query: (text: any, values?: any) =>
+      typeof text === "string"
+        ? pg.query(text, values)
+        : pg.query(text.text, text.values),
+    connect: async () => {},
+    end: async () => {},
+  };
+
+  await runner({
+    dbClient,
+    dir: MIGRATIONS_DIR,
+    direction: "up",
+    migrationsTable: "pgmigrations",
+    verbose: false,
+  });
+
+  return {
+    query: (text: string, values?: unknown[]) =>
+      pg.query(text, values as any[]) as any,
+    close: () => pg.close(),
+  };
+}

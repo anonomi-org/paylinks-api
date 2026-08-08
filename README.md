@@ -50,6 +50,22 @@ A privacy-focused API for creating Monero donation links with subaddress generat
    npm run dev
    ```
 
+## Tests
+
+```bash
+npm test        # unit + database tests
+npm run typecheck
+```
+
+Nothing needs to be running first. The database tests spin up PGlite — real
+PostgreSQL compiled to WebAssembly — in-process, apply the migrations from
+`migrations/`, and exercise the same query functions the handlers call. No
+Docker, no service container, no `DATABASE_URL`.
+
+The Monero test vectors in `test/vectors.ts` were generated from a throwaway
+seed that is committed alongside them, so every expected address can be
+regenerated and audited.
+
 ## Production Deployment
 
 ### Using Docker Compose
