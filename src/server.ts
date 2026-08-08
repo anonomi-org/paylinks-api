@@ -1,4 +1,4 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -144,21 +144,35 @@ function genericDeleteMessageBulk() {
 // Generic error that doesn't reveal if paylink exists, is inactive, or deleted
 const PAYLINK_UNAVAILABLE_ERROR = { error: "paylink_unavailable" } as const;
 
-// Minimum response time to prevent timing attacks
-// Ensures total response time is at least minMs, with jitter
+// Response-time floor for the paylink API.
+//
+// Every paylink response is held to at least MIN_RESPONSE_TIME_MS and then
+// given jitter on top, so a caller cannot tell an existing paylink from a
+// missing one, or a matching owner key from a wrong one, by timing the reply.
+//
+// This is applied in an onSend hook rather than at each return statement. The
+// previous version padded only the not-found branches, which left the success
+// paths answering in single-digit milliseconds and preserved the exact
+// enumeration signal the padding was meant to remove.
 const MIN_RESPONSE_TIME_MS = 200;
+const MAX_JITTER_MS = 100;
 
-async function ensureMinimumTime<T>(
-  startTime: number,
-  result: T,
-): Promise<T> {
-  const elapsed = Date.now() - startTime;
-  if (elapsed < MIN_RESPONSE_TIME_MS) {
-    // Add remaining time plus random jitter (0-100ms)
-    const remaining = MIN_RESPONSE_TIME_MS - elapsed + crypto.randomInt(0, 100);
-    await new Promise((r) => setTimeout(r, remaining));
-  }
-  return result;
+/** Wall clock can step backwards; hrtime cannot, so the pad stays bounded. */
+function monotonicNowMs(): number {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+async function padToFloor(startedAtMs: number): Promise<void> {
+  const elapsed = monotonicNowMs() - startedAtMs;
+
+  // Jitter is added unconditionally rather than only when the response came in
+  // under the floor. A response that already took longer than the floor is
+  // exactly the case where the underlying work was slow enough for its timing
+  // to say something, so it needs noise too.
+  const toFloor = Math.max(MIN_RESPONSE_TIME_MS - elapsed, 0);
+  const jitter = crypto.randomInt(0, MAX_JITTER_MS + 1); // 0-100 inclusive
+
+  await new Promise((r) => setTimeout(r, toFloor + jitter));
 }
 
 function computeOwnerKey(publicAddress: string, privateViewKey: string) {
@@ -233,16 +247,34 @@ async function main() {
   // Global rate limit
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
 
+  // Response-time floor, applied to every paylink response in one place.
+  //
+  // onSend runs after the handler has returned, which means the padding no
+  // longer happens while the handler still holds a database client. The old
+  // per-route version slept inside the try block that owned the connection, so
+  // a handful of concurrent requests could empty the pool for a quarter second.
+  const requestStart = new WeakMap<FastifyRequest, number>();
+
+  const isPaddedRoute = (req: FastifyRequest) =>
+    req.method !== "OPTIONS" && req.url.startsWith("/api/paylinks");
+
+  app.addHook("onRequest", async (req) => {
+    if (isPaddedRoute(req)) requestStart.set(req, monotonicNowMs());
+  });
+
+  app.addHook("onSend", async (req, _reply, payload) => {
+    const startedAt = requestStart.get(req);
+    if (startedAt !== undefined) await padToFloor(startedAt);
+    return payload;
+  });
+
   app.get("/health", async () => ({ ok: true }));
 
   // PUBLIC METADATA (used by donation page on load)
   // Returns label + fingerprint
   app.get("/api/paylinks/:id/meta", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
@@ -265,7 +297,6 @@ async function main() {
 
       // Same response for not found, inactive, or deleted - no info leakage
       if (r.rowCount !== 1 || !r.rows[0]!.active || r.rows[0]!.deleted_at) {
-        await ensureMinimumTime(startTime, null);
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
@@ -463,11 +494,8 @@ async function main() {
 
   // DELETE ONE (hard delete by id + ownerKey)
   app.post("/api/paylinks/:id/delete", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       // Same response as success - no info leakage about ID validity
       return reply.code(200).send({
         ok: true,
@@ -500,9 +528,6 @@ async function main() {
 
       await client.query("COMMIT");
 
-      // Ensure minimum response time to prevent timing attacks
-      await ensureMinimumTime(startTime, null);
-
       // Always 200, never indicates if it existed or matched
       return reply.code(200).send({
         ok: true,
@@ -519,8 +544,6 @@ async function main() {
   });
 
   app.post("/api/paylinks/delete", async (req, reply) => {
-    const startTime = Date.now();
-
     const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply
@@ -544,7 +567,6 @@ async function main() {
 
       await client.query("COMMIT");
 
-      await ensureMinimumTime(startTime, null);
 
       return reply.code(200).send({
         ok: true,
@@ -561,11 +583,8 @@ async function main() {
 
   // Donor requests a payment payload (random index each time)
   app.post("/api/paylinks/:id/request", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
@@ -612,7 +631,6 @@ async function main() {
 
       // Same response for not found, inactive, or deleted - no info leakage
       if (paylinkRes.rowCount !== 1 || !paylinkRes.rows[0]!.active || paylinkRes.rows[0]!.deleted_at) {
-        await ensureMinimumTime(startTime, null);
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
