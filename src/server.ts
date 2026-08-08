@@ -1,4 +1,7 @@
-import Fastify, { type FastifyRequest } from "fastify";
+import Fastify, {
+  type FastifyError,
+  type FastifyRequest,
+} from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -187,15 +190,28 @@ async function main() {
     logger: {
       level: "info",
       redact: {
+        // Fastify's own request logging never carried a body, so the previous
+        // "req.body.*" paths could not match anything. These are the shapes an
+        // explicit log call would actually produce, so they fire if someone
+        // later writes req.log.info({ body }) or logs a field directly.
         paths: [
-          "req.body.ownerKey",
-          "req.body.privateViewKey",
-          "req.body.publicAddress",
+          "ownerKey",
+          "privateViewKey",
+          "publicAddress",
+          "body.ownerKey",
+          "body.privateViewKey",
+          "body.publicAddress",
         ],
         remove: true,
       },
     },
-    disableRequestLogging: false,
+    // The donate page keeps the paylink id in the URL fragment specifically so
+    // it never reaches a server log. Fastify's request logging would undo that:
+    // it writes the id - which is in the API path - next to the caller's IP on
+    // every hit, producing exactly the access record the fragment avoids. On a
+    // service that offers Tor deployment and advertises no tracking, that trade
+    // is not worth an access log.
+    disableRequestLogging: true,
     bodyLimit: 16384, // 16KB max body size
   });
 
@@ -266,6 +282,23 @@ async function main() {
     const startedAt = requestStart.get(req);
     if (startedAt !== undefined) await padToFloor(startedAt);
     return payload;
+  });
+
+  // Fastify gates its default 5xx log behind disableRequestLogging, so turning
+  // request logging off would otherwise leave server errors completely silent.
+  // Its default handler also logs the serialized request, which would put the
+  // paylink id and the caller's IP straight back into the log we just removed.
+  // Log the error on its own instead: enough to diagnose a fault, nothing that
+  // records who asked for which paylink.
+  app.setErrorHandler((err: FastifyError, req, reply) => {
+    const statusCode = err.statusCode ?? 500;
+
+    if (statusCode >= 500) {
+      req.log.error({ err }, "request failed");
+      return reply.code(500).send({ error: "internal_error" });
+    }
+
+    return reply.code(statusCode).send(err);
   });
 
   app.get("/health", async () => ({ ok: true }));
