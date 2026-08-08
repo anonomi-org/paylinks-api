@@ -6,7 +6,13 @@
   "compilerOptions": {
     "noEmit": true,
     // Nothing is emitted here, so widen rootDir to take test/ into the program.
-    "rootDir": "."
+    "rootDir": ".",
+    // The test-only dependencies publish their types through an "exports" map,
+    // which the classic "node" resolution the build uses cannot follow. Files
+    // stay CommonJS - package.json has no "type": "module" - so this only
+    // changes how types are located, not how anything is emitted or run.
+    "module": "node16",
+    "moduleResolution": "node16"
   },
   "include": ["src/**/*", "test/**/*"]
 }
