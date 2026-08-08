@@ -104,3 +104,28 @@ export async function deriveSubaddress(
     await wallet.close();
   }
 }
+
+/**
+ * Derive every subaddress from `fromIndex` to `toIndex` inclusive.
+ *
+ * One wallet handle is opened for the whole range rather than one per address,
+ * which is what makes precomputing a pool at creation time affordable. The
+ * caller is expected to have bounded the range already.
+ */
+export async function deriveSubaddressRange(
+  publicAddress: string,
+  privateViewKey: string,
+  fromIndex: number,
+  toIndex: number,
+): Promise<{ index: number; address: string }[]> {
+  const wallet = await openKeysWallet(publicAddress, privateViewKey);
+  try {
+    const out: { index: number; address: string }[] = [];
+    for (let index = fromIndex; index <= toIndex; index++) {
+      out.push({ index, address: await wallet.getAddress(0, index) });
+    }
+    return out;
+  } finally {
+    await wallet.close();
+  }
+}
