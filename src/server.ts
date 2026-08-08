@@ -7,8 +7,11 @@ import { z } from "zod";
 import { pool } from "./db";
 import { encryptViewKey, decryptViewKey } from "./crypto";
 import { buildMoneroUri } from "./moneroUri";
-import { decodeStandardAddress } from "./monero/decodeAddress";
-import * as subaddress from "subaddress";
+import {
+  assertValidPrimaryAddressAndViewKey,
+  deriveSubaddress,
+  warmup as warmupMoneroAddressing,
+} from "./monero/address";
 import crypto from "crypto";
 
 const MAX_SUBADDRESS_INDEX = 1_000_000;
@@ -49,8 +52,13 @@ const PaylinkOptionsSchema = z
   .optional();
 
 const CreatePaylinkSchema = z.object({
+  // Shape only. Whether these are a genuine mainnet primary address and its
+  // matching view key is decided in src/monero/address.ts, not here.
   publicAddress: z.string().trim().min(20).max(200),
-  privateViewKey: z.string().trim().min(20).max(200),
+  privateViewKey: z
+    .string()
+    .trim()
+    .regex(/^[0-9a-f]{64}$/i, "privateViewKey must be 64 hex chars"),
   options: PaylinkOptionsSchema,
 });
 
@@ -363,12 +371,14 @@ async function main() {
     let addressPreview: string | null = null;
 
     try {
-      const decoded = decodeStandardAddress(publicAddress);
+      // Rejects a bad checksum, a subaddress, the wrong network, a malleated
+      // encoding, and - the one that used to lose money silently - a view key
+      // that does not belong to this address.
+      await assertValidPrimaryAddressAndViewKey(publicAddress, privateViewKey);
 
-      const addrAtMin = subaddress.getSubaddress(
+      const addrAtMin = await deriveSubaddress(
+        publicAddress,
         privateViewKey,
-        decoded.publicSpendKeyHex,
-        0,
         minIndex,
       );
 
@@ -376,7 +386,11 @@ async function main() {
     } catch {
       return reply.code(400).send({
         error: "invalid_request",
-        details: { publicAddress: ["Invalid Monero primary address."] },
+        details: {
+          publicAddress: [
+            "Not a valid Monero mainnet address, or the view key does not match it.",
+          ],
+        },
       });
     }
 
@@ -616,12 +630,14 @@ async function main() {
         paylink.encrypted_view_key,
         paylink.encryption_nonce,
       );
-      const decoded = decodeStandardAddress(paylink.public_address);
 
-      const address = subaddress.getSubaddress(
+      // Rows created before address validation existed may hold a mismatched
+      // address/view-key pair. Those now throw into the handler's catch and
+      // surface as an error instead of quietly handing the donor an address
+      // that nobody can spend from.
+      const address = await deriveSubaddress(
+        paylink.public_address,
         viewKey,
-        decoded.publicSpendKeyHex,
-        0,
         index,
       );
 
@@ -649,6 +665,11 @@ async function main() {
       client.release();
     }
   });
+
+  // Loading the Monero WASM module takes roughly 300ms. Do it before the port
+  // opens so the first real request doesn't wear that cost, and so a broken
+  // install fails at boot rather than on someone's donation.
+  await warmupMoneroAddressing();
 
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? "0.0.0.0";

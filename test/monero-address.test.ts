@@ -1,9 +1,10 @@
-import test, { before } from "node:test";
+import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   assertValidPrimaryAddressAndViewKey,
   deriveSubaddress,
+  shutdown,
   warmup,
 } from "../src/monero/address";
 
@@ -17,6 +18,12 @@ import {
 
 before(async () => {
   await warmup();
+});
+
+// The WASM worker holds the event loop open, so without this the suite passes
+// and then hangs forever instead of exiting.
+after(async () => {
+  await shutdown();
 });
 
 // --- what must be accepted -------------------------------------------------
