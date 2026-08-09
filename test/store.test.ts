@@ -29,7 +29,6 @@ const OWNER_B = "b".repeat(64);
 function paylink(overrides: Partial<NewPaylink> = {}): NewPaylink {
   return {
     label: "Coffee",
-    publicAddress: "49YpRdMYkkR6RYpuF2RQeEaP1X7xSNnxLNzvkwZAPBen45RKJ",
     genMode: "random",
     minIndex: 1,
     maxIndex: 10,
@@ -69,6 +68,28 @@ test("stores no view key material at all", async () => {
   const names = cols.rows.map((c) => c.column_name);
   assert.ok(!names.includes("encrypted_view_key"));
   assert.ok(!names.includes("encryption_nonce"));
+});
+
+test("records no recipient address for a new paylink", async () => {
+  // The column still exists so an older release keeps working, but nothing
+  // writes to it now.
+  const id = await insertPaylink(db, paylink());
+
+  const r = await db.query<{ public_address: string | null }>(
+    `SELECT public_address FROM paylinks WHERE id = $1`,
+    [id],
+  );
+  assert.equal(r.rows[0]?.public_address, null);
+});
+
+test("the address column no longer demands a value", async () => {
+  // What 003 had to do for the insert above to work. Checking the schema rather
+  // than a row count is what catches the migration being reverted.
+  const col = await db.query<{ is_nullable: string }>(
+    `SELECT is_nullable FROM information_schema.columns
+     WHERE table_name = 'paylinks' AND column_name = 'public_address'`,
+  );
+  assert.equal(col.rows[0]?.is_nullable, "YES");
 });
 
 test("writes a whole address pool in one statement", async () => {

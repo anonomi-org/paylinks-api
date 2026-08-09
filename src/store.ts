@@ -28,9 +28,12 @@ export type PaylinkForRequest = PaylinkMeta & {
   max_index: number;
 };
 
+/**
+ * No public address here on purpose. It is used to derive the pool and compute
+ * the owner key, both before this row is written, and nothing reads it after.
+ */
 export type NewPaylink = {
   label: string | null;
-  publicAddress: string;
   genMode: string;
   minIndex: number;
   maxIndex: number;
@@ -46,16 +49,15 @@ export async function insertPaylink(
     `
     INSERT INTO paylinks (
       label,
-      public_address,
       gen_mode,
       min_index,
       max_index,
       owner_key
     )
-    VALUES ($1,$2,$3,$4,$5,$6)
+    VALUES ($1,$2,$3,$4,$5)
     RETURNING id
     `,
-    [p.label, p.publicAddress, p.genMode, p.minIndex, p.maxIndex, p.ownerKey],
+    [p.label, p.genMode, p.minIndex, p.maxIndex, p.ownerKey],
   );
 
   const id = res.rows[0]?.id;
@@ -80,11 +82,7 @@ export async function insertSubaddresses(
     SELECT $1, idx, addr
     FROM unnest($2::int[], $3::text[]) AS t(idx, addr)
     `,
-    [
-      paylinkId,
-      entries.map((e) => e.index),
-      entries.map((e) => e.address),
-    ],
+    [paylinkId, entries.map((e) => e.index), entries.map((e) => e.address)],
   );
 }
 
