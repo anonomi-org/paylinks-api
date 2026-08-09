@@ -85,15 +85,30 @@ regenerated and audited.
    openssl rand -hex 16
    ```
 
-3. Start the services:
+3. Run migrations:
+   ```bash
+   docker compose --profile migrate up migrate
+   ```
+
+4. Start the services:
    ```bash
    docker compose up -d
    ```
 
-4. Run migrations:
-   ```bash
-   docker compose --profile migrate up migrate
-   ```
+### Running without Docker
+
+Compose is one way to run this, not the only one, and the Dockerfile is not
+required. Under a process supervisor the same rules apply:
+
+- Build first — `npm ci && npm run build` — then run `dist/server.js`.
+- **Run migrations before the app starts**, not beside it. A pre-start hook is
+  the right place for them, and letting a migration failure block startup is
+  deliberate: serving against a stale schema is worse than not serving.
+- The migration CLI needs an action verb. `node-pg-migrate -m migrations up`,
+  or `npm run migrate up`, which is the same thing.
+- Everything is read from the environment; the app never opens a config file.
+  A supervisor can therefore hold the secrets in a file the service user cannot
+  read and pass them in.
 
 ### Updating
 
@@ -109,6 +124,9 @@ The order matters: a release can depend on a column its migration has already
 adjusted, so starting the new code first leaves writes failing until the
 migration catches up. Migrations here are written so the previous release still
 works against the new schema, which is what keeps a rollback possible.
+
+Under a supervisor that runs migrations as a pre-start hook, a rebuild and
+restart already does both in that order.
 
 Database data persists in the Docker volume.
 
