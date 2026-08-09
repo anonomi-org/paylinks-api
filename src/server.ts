@@ -1,7 +1,4 @@
-import Fastify, {
-  type FastifyError,
-  type FastifyRequest,
-} from "fastify";
+import Fastify, { type FastifyError, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -44,7 +41,10 @@ function getAllowedOrigins(): string[] | true {
     }
     return true; // Allow all in development
   }
-  return env.split(",").map((o) => o.trim()).filter(Boolean);
+  return env
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
 }
 
 function getDonateBaseUrl(): string {
@@ -193,6 +193,64 @@ async function padToFloor(startedAtMs: number): Promise<void> {
   await new Promise((r) => setTimeout(r, toFloor + jitter));
 }
 
+// --- deployment configuration ----------------------------------------------
+//
+// This service runs in two shapes that cannot be told apart at runtime, so the
+// operator declares which one they are in.
+//
+// As a Tor hidden service, every request arrives from the local Tor daemon:
+// there is no client address to read, and no header that would reveal one.
+// Clients are genuinely indistinguishable, which is the product working, not a
+// misconfiguration.
+//
+// On the clearnet - which is how anyone self-hosting this is likely to run it -
+// requests usually arrive through a reverse proxy terminating TLS, and the real
+// client address is in X-Forwarded-For.
+//
+// Guessing wrong in either direction is harmful, so nothing here is inferred.
+
+/**
+ * Whether to believe X-Forwarded-For, and how far down it to look.
+ *
+ * Off unless explicitly set. Trusting that header with no proxy in front lets
+ * any client claim any address, which forges the rate-limit key and removes the
+ * limit altogether - a worse failure than the one it fixes.
+ *
+ * Accepts "true", a hop count, or a comma-separated list of trusted addresses
+ * or subnets, all of which Fastify understands directly.
+ */
+function getTrustProxy(): boolean | number | string {
+  const raw = process.env.TRUST_PROXY?.trim();
+  if (!raw || raw === "false") return false;
+  if (raw === "true") return true;
+
+  const hops = Number(raw);
+  if (Number.isInteger(hops) && hops >= 0) return hops;
+
+  return raw;
+}
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+// Applies to the endpoints that only read: cheap, so the ceiling is generous.
+const RATE_LIMIT_MAX = envPositiveInt("RATE_LIMIT_MAX", 120);
+const RATE_LIMIT_WINDOW = process.env.RATE_LIMIT_WINDOW?.trim() || "1 minute";
+
+// Creating a paylink derives its whole address pool: up to ~400ms of CPU and
+// ~93KB at the cap, unauthenticated. It needs a far tighter budget than a read,
+// and on a hidden service - where an abuser cannot be identified, let alone
+// blocked - this limit is the only thing standing in front of that cost.
+const RATE_LIMIT_CREATE_MAX = envPositiveInt("RATE_LIMIT_CREATE_MAX", 20);
+
+// Keyed per paylink rather than per caller, so one link cannot have its whole
+// address pool harvested. A donation page spends exactly one of these per visit.
+const RATE_LIMIT_REQUEST_MAX = envPositiveInt("RATE_LIMIT_REQUEST_MAX", 60);
+
 function computeOwnerKey(publicAddress: string, privateViewKey: string) {
   return crypto
     .createHash("sha256")
@@ -228,6 +286,7 @@ async function main() {
     // is not worth an access log.
     disableRequestLogging: true,
     bodyLimit: 16384, // 16KB max body size
+    trustProxy: getTrustProxy(),
   });
 
   // CORS configuration
@@ -236,9 +295,21 @@ async function main() {
 
   // Security headers - configured for JSON API (not HTML)
   // Disabled headers that can interfere with CORS/Tor
-  // HSTS disabled for Tor deployments (.onion uses HTTP, Tor provides encryption)
-  const enableHsts =
-    process.env.NODE_ENV === "production" && !allowNullOrigin;
+  //
+  // HSTS is opt-in and independent of everything else. It used to be switched
+  // off by ALLOW_NULL_ORIGIN, an unrelated CORS setting, which meant admitting
+  // Tor Browser silently changed transport security. The two answers also differ
+  // by deployment: a hidden service is plain HTTP and must never send it, while
+  // a clearnet deployment behind TLS usually should.
+  //
+  // Default off because it is close to irreversible. A browser that has seen the
+  // header honours it for the full max-age no matter what the server does next,
+  // so the only way back is serving max-age=0 and waiting for every client to
+  // return. includeSubDomains is separate for the same reason: it commits every
+  // sibling host, which is not a decision to inherit from a default.
+  const enableHsts = process.env.ENABLE_HSTS === "true";
+  const hstsMaxAge = envPositiveInt("HSTS_MAX_AGE", 31_536_000);
+  const hstsIncludeSubDomains = process.env.HSTS_INCLUDE_SUBDOMAINS === "true";
 
   await app.register(helmet, {
     contentSecurityPolicy: false, // API doesn't serve HTML
@@ -248,7 +319,13 @@ async function main() {
     originAgentCluster: false, // Not relevant for API
     dnsPrefetchControl: { allow: false },
     frameguard: { action: "deny" },
-    hsts: enableHsts ? { maxAge: 31536000 } : false,
+    hsts: enableHsts
+      ? {
+          maxAge: hstsMaxAge,
+          includeSubDomains: hstsIncludeSubDomains,
+          preload: false,
+        }
+      : false,
     noSniff: true,
     referrerPolicy: { policy: "no-referrer" },
     xssFilter: true,
@@ -276,7 +353,16 @@ async function main() {
   });
 
   // Global rate limit
-  await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
+  // Global limit. Keyed on req.ip, which is only meaningful when the address is
+  // real: directly exposed, or behind a proxy with TRUST_PROXY set. On a hidden
+  // service every request shares one address and therefore one bucket, so this
+  // acts as a service-wide ceiling rather than a per-client one. That is a
+  // property of Tor, not something configuration can fix - the per-route limits
+  // below are what carry the load there.
+  await app.register(rateLimit, {
+    max: RATE_LIMIT_MAX,
+    timeWindow: RATE_LIMIT_WINDOW,
+  });
 
   // Response-time floor, applied to every paylink response in one place.
   //
@@ -352,179 +438,196 @@ async function main() {
   });
 
   // CREATE (always creates a new paylink)
-  app.post("/api/paylinks", async (req, reply) => {
-    const parsed = CreatePaylinkSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply
-        .code(400)
-        .send({ error: "invalid_request", details: parsed.error.flatten() });
-    }
-
-    const { publicAddress, privateViewKey } = parsed.data;
-    const options = parsed.data.options ?? {};
-
-    const rawLabel =
-      typeof options.label === "string"
-        ? options.label.trim().slice(0, 80)
-        : "";
-
-    const label = rawLabel.length > 0 ? rawLabel : null;
-
-    // Random-only
-    const genModeRaw = String(options.genMode ?? "random").toLowerCase();
-    if (genModeRaw === "sequential") {
-      return reply.code(400).send({
-        error: "invalid_request",
-        details: {
-          options: {
-            genMode: ["'sequential' is not supported. Use 'random'."],
-          },
+  //
+  // A route-level limit replaces the global one rather than stacking with it,
+  // so this is the only ceiling on the most expensive endpoint in the service.
+  app.post(
+    "/api/paylinks",
+    {
+      config: {
+        rateLimit: {
+          max: RATE_LIMIT_CREATE_MAX,
+          timeWindow: RATE_LIMIT_WINDOW,
         },
-      });
-    }
-    const genMode: "random" = "random";
+      },
+    },
+    async (req, reply) => {
+      const parsed = CreatePaylinkSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send({ error: "invalid_request", details: parsed.error.flatten() });
+      }
 
-    const minIndexRaw = Number.isFinite(options.minIndex as any)
-      ? Math.trunc(Number(options.minIndex))
-      : null;
-    const maxIndexRaw = Number.isFinite(options.maxIndex as any)
-      ? Math.trunc(Number(options.maxIndex))
-      : null;
+      const { publicAddress, privateViewKey } = parsed.data;
+      const options = parsed.data.options ?? {};
 
-    // Validate raw bounds if provided
-    if (
-      minIndexRaw !== null &&
-      (minIndexRaw < 1 || minIndexRaw > MAX_SUBADDRESS_INDEX)
-    ) {
-      return reply.code(400).send({
-        error: "invalid_request",
-        details: {
-          options: {
-            minIndex: [
-              `minIndex must be between 1 and ${MAX_SUBADDRESS_INDEX}`,
-            ],
+      const rawLabel =
+        typeof options.label === "string"
+          ? options.label.trim().slice(0, 80)
+          : "";
+
+      const label = rawLabel.length > 0 ? rawLabel : null;
+
+      // Random-only
+      const genModeRaw = String(options.genMode ?? "random").toLowerCase();
+      if (genModeRaw === "sequential") {
+        return reply.code(400).send({
+          error: "invalid_request",
+          details: {
+            options: {
+              genMode: ["'sequential' is not supported. Use 'random'."],
+            },
           },
-        },
-      });
-    }
-    if (
-      maxIndexRaw !== null &&
-      (maxIndexRaw < 1 || maxIndexRaw > MAX_SUBADDRESS_INDEX)
-    ) {
-      return reply.code(400).send({
-        error: "invalid_request",
-        details: {
-          options: {
-            maxIndex: [
-              `maxIndex must be between 1 and ${MAX_SUBADDRESS_INDEX}`,
-            ],
+        });
+      }
+      const genMode: "random" = "random";
+
+      const minIndexRaw = Number.isFinite(options.minIndex as any)
+        ? Math.trunc(Number(options.minIndex))
+        : null;
+      const maxIndexRaw = Number.isFinite(options.maxIndex as any)
+        ? Math.trunc(Number(options.maxIndex))
+        : null;
+
+      // Validate raw bounds if provided
+      if (
+        minIndexRaw !== null &&
+        (minIndexRaw < 1 || minIndexRaw > MAX_SUBADDRESS_INDEX)
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          details: {
+            options: {
+              minIndex: [
+                `minIndex must be between 1 and ${MAX_SUBADDRESS_INDEX}`,
+              ],
+            },
           },
-        },
-      });
-    }
-
-    // Canonicalized + clamped
-    const { lo, hi } = normalizeRange(
-      minIndexRaw,
-      maxIndexRaw,
-      DEFAULT_MIN_INDEX,
-      DEFAULT_MAX_INDEX,
-    );
-    const minIndex = clampIndex(lo);
-    const maxIndex = clampIndex(hi);
-
-    // Every subaddress is derived up front, so the range is also the amount of
-    // work and storage a single request can ask for. The indices themselves may
-    // still be large; it is the count that has to stay bounded.
-    const poolSize = maxIndex - minIndex + 1;
-    if (poolSize > MAX_POOL_SIZE) {
-      return reply.code(400).send({
-        error: "invalid_request",
-        details: {
-          options: {
-            maxIndex: [
-              `minIndex and maxIndex may span at most ${MAX_POOL_SIZE} addresses (requested ${poolSize})`,
-            ],
+        });
+      }
+      if (
+        maxIndexRaw !== null &&
+        (maxIndexRaw < 1 || maxIndexRaw > MAX_SUBADDRESS_INDEX)
+      ) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          details: {
+            options: {
+              maxIndex: [
+                `maxIndex must be between 1 and ${MAX_SUBADDRESS_INDEX}`,
+              ],
+            },
           },
-        },
-      });
-    }
+        });
+      }
 
-    // Derive the whole pool now, while the view key is in hand. After this
-    // request the key is gone - it is never written to the database, so a
-    // compromise of this service cannot reconstruct anybody's payment history.
-    let subaddresses: { index: number; address: string }[];
-    try {
-      // Rejects a bad checksum, a subaddress, the wrong network, a malleated
-      // encoding, and - the one that used to lose money silently - a view key
-      // that does not belong to this address.
-      await assertValidPrimaryAddressAndViewKey(publicAddress, privateViewKey);
-
-      subaddresses = await deriveSubaddressRange(
-        publicAddress,
-        privateViewKey,
-        minIndex,
-        maxIndex,
+      // Canonicalized + clamped
+      const { lo, hi } = normalizeRange(
+        minIndexRaw,
+        maxIndexRaw,
+        DEFAULT_MIN_INDEX,
+        DEFAULT_MAX_INDEX,
       );
-    } catch {
-      return reply.code(400).send({
-        error: "invalid_request",
-        details: {
-          publicAddress: [
-            "Not a valid Monero mainnet address, or the view key does not match it.",
-          ],
-        },
-      });
-    }
+      const minIndex = clampIndex(lo);
+      const maxIndex = clampIndex(hi);
 
-    // Preview so the user can sanity-check the first address in their wallet.
-    const addressPreview = previewAddr(subaddresses[0]!.address);
+      // Every subaddress is derived up front, so the range is also the amount of
+      // work and storage a single request can ask for. The indices themselves may
+      // still be large; it is the count that has to stay bounded.
+      const poolSize = maxIndex - minIndex + 1;
+      if (poolSize > MAX_POOL_SIZE) {
+        return reply.code(400).send({
+          error: "invalid_request",
+          details: {
+            options: {
+              maxIndex: [
+                `minIndex and maxIndex may span at most ${MAX_POOL_SIZE} addresses (requested ${poolSize})`,
+              ],
+            },
+          },
+        });
+      }
 
-    const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
+      // Derive the whole pool now, while the view key is in hand. After this
+      // request the key is gone - it is never written to the database, so a
+      // compromise of this service cannot reconstruct anybody's payment history.
+      let subaddresses: { index: number; address: string }[];
+      try {
+        // Rejects a bad checksum, a subaddress, the wrong network, a malleated
+        // encoding, and - the one that used to lose money silently - a view key
+        // that does not belong to this address.
+        await assertValidPrimaryAddressAndViewKey(
+          publicAddress,
+          privateViewKey,
+        );
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+        subaddresses = await deriveSubaddressRange(
+          publicAddress,
+          privateViewKey,
+          minIndex,
+          maxIndex,
+        );
+      } catch {
+        return reply.code(400).send({
+          error: "invalid_request",
+          details: {
+            publicAddress: [
+              "Not a valid Monero mainnet address, or the view key does not match it.",
+            ],
+          },
+        });
+      }
 
-      const id = await insertPaylink(client, {
-        label,
-        publicAddress,
-        genMode,
-        minIndex,
-        maxIndex,
-        ownerKey,
-      });
+      // Preview so the user can sanity-check the first address in their wallet.
+      const addressPreview = previewAddr(subaddresses[0]!.address);
 
-      await insertSubaddresses(client, id, subaddresses);
+      const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
 
-      await client.query("COMMIT");
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
-      const donateUrl = `${getDonateBaseUrl()}${id}`;
-      const embedHtml =
-        `<!-- Anonomi Paylinks -->\n` +
-        `<a href="${donateUrl}" rel="nofollow noopener" target="_blank">Donate XMR</a>\n`;
+        const id = await insertPaylink(client, {
+          label,
+          publicAddress,
+          genMode,
+          minIndex,
+          maxIndex,
+          ownerKey,
+        });
 
-      const fingerprint = computePaylinkFingerprint(id);
+        await insertSubaddresses(client, id, subaddresses);
 
-      return reply.code(201).send({
-        id,
-        label,
-        donateUrl,
-        embedHtml,
-        fingerprint,
-        genMode,
-        minIndex,
-        maxIndex,
-        addressPreview,
-      });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      req.log.error({ err }, "create paylink failed");
-      return reply.code(500).send({ error: "internal_error" });
-    } finally {
-      client.release();
-    }
-  });
+        await client.query("COMMIT");
+
+        const donateUrl = `${getDonateBaseUrl()}${id}`;
+        const embedHtml =
+          `<!-- Anonomi Paylinks -->\n` +
+          `<a href="${donateUrl}" rel="nofollow noopener" target="_blank">Donate XMR</a>\n`;
+
+        const fingerprint = computePaylinkFingerprint(id);
+
+        return reply.code(201).send({
+          id,
+          label,
+          donateUrl,
+          embedHtml,
+          fingerprint,
+          genMode,
+          minIndex,
+          maxIndex,
+          addressPreview,
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        req.log.error({ err }, "create paylink failed");
+        return reply.code(500).send({ error: "internal_error" });
+      } finally {
+        client.release();
+      }
+    },
+  );
 
   // DELETE ONE (hard delete by id + ownerKey)
   app.post("/api/paylinks/:id/delete", async (req, reply) => {
@@ -589,7 +692,6 @@ async function main() {
 
       await client.query("COMMIT");
 
-
       return reply.code(200).send({
         ok: true,
         message: genericDeleteMessageBulk(),
@@ -604,77 +706,97 @@ async function main() {
   });
 
   // Donor requests a payment payload (random index each time)
-  app.post("/api/paylinks/:id/request", async (req, reply) => {
-    const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
-    if (!idResult.success) {
-      return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
-    }
-    const id = idResult.data;
-
-    const parsed = RequestDonationSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply
-        .code(400)
-        .send({ error: "invalid_request", details: parsed.error.flatten() });
-    }
-
-    const { amount, description } = parsed.data;
-
-    const client = await pool.connect();
-    try {
-      const paylink = await findPaylinkForRequest(client, id);
-
-      // Same response for not found, inactive, or deleted - no info leakage
-      if (!paylink || !paylink.active || paylink.deleted_at) {
+  //
+  // Keyed on caller *and* paylink. On the clearnet with a real client address
+  // that bounds each visitor per link; on a hidden service the address is the
+  // same for everyone, so it collapses to a per-paylink cap - which is the part
+  // that matters, since it stops one link's address pool being harvested. There
+  // is deliberately no cross-paylink ceiling here: the handler is a primary-key
+  // lookup, and the response-time floor already paces callers.
+  app.post(
+    "/api/paylinks/:id/request",
+    {
+      config: {
+        rateLimit: {
+          max: RATE_LIMIT_REQUEST_MAX,
+          timeWindow: RATE_LIMIT_WINDOW,
+          keyGenerator: (req: FastifyRequest) =>
+            `${req.ip}:${(req.params as any)?.id ?? ""}`,
+        },
+      },
+    },
+    async (req, reply) => {
+      const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
+      if (!idResult.success) {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
+      const id = idResult.data;
 
-      // DB enforces these, but clamp anyway
-      const safeLo = clampIndex(paylink.min_index);
-      const safeHi = clampIndex(paylink.max_index);
-      const lo = Math.min(safeLo, safeHi);
-      const hi = Math.max(safeLo, safeHi);
-
-      const index = crypto.randomInt(lo, hi + 1);
-
-      // The pool was derived and stored at creation time, so serving a donation
-      // is a primary-key lookup and this service holds no key material at all.
-      const address = await findSubaddress(client, id, index);
-      if (!address) {
-        // The row's stored range disagrees with the pool that was written for
-        // it, so the paylink cannot be served. Same opaque answer as a missing
-        // paylink rather than a distinguishable error.
-        req.log.error(
-          { subaddressIndex: index },
-          "paylink has no address at the requested index",
-        );
-        return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+      const parsed = RequestDonationSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send({ error: "invalid_request", details: parsed.error.flatten() });
       }
 
-      const uri = buildMoneroUri({
-        address,
-        amount: amount || undefined,
-        description: description || undefined,
-      });
+      const { amount, description } = parsed.data;
 
-      const fingerprint = computePaylinkFingerprint(id);
+      const client = await pool.connect();
+      try {
+        const paylink = await findPaylinkForRequest(client, id);
 
-      return reply.code(200).send({
-        paylinkId: id,
-        label: paylink.label ?? "",
-        address,
-        amount: amount ?? "",
-        description,
-        uri,
-        fingerprint,
-      });
-    } catch (err) {
-      req.log.error({ err }, "request donation failed");
-      return reply.code(500).send({ error: "internal_error" });
-    } finally {
-      client.release();
-    }
-  });
+        // Same response for not found, inactive, or deleted - no info leakage
+        if (!paylink || !paylink.active || paylink.deleted_at) {
+          return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+        }
+
+        // DB enforces these, but clamp anyway
+        const safeLo = clampIndex(paylink.min_index);
+        const safeHi = clampIndex(paylink.max_index);
+        const lo = Math.min(safeLo, safeHi);
+        const hi = Math.max(safeLo, safeHi);
+
+        const index = crypto.randomInt(lo, hi + 1);
+
+        // The pool was derived and stored at creation time, so serving a donation
+        // is a primary-key lookup and this service holds no key material at all.
+        const address = await findSubaddress(client, id, index);
+        if (!address) {
+          // The row's stored range disagrees with the pool that was written for
+          // it, so the paylink cannot be served. Same opaque answer as a missing
+          // paylink rather than a distinguishable error.
+          req.log.error(
+            { subaddressIndex: index },
+            "paylink has no address at the requested index",
+          );
+          return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+        }
+
+        const uri = buildMoneroUri({
+          address,
+          amount: amount || undefined,
+          description: description || undefined,
+        });
+
+        const fingerprint = computePaylinkFingerprint(id);
+
+        return reply.code(200).send({
+          paylinkId: id,
+          label: paylink.label ?? "",
+          address,
+          amount: amount ?? "",
+          description,
+          uri,
+          fingerprint,
+        });
+      } catch (err) {
+        req.log.error({ err }, "request donation failed");
+        return reply.code(500).send({ error: "internal_error" });
+      } finally {
+        client.release();
+      }
+    },
+  );
 
   // Loading the Monero WASM module takes roughly 300ms. Do it before the port
   // opens so the first real request doesn't wear that cost, and so a broken
