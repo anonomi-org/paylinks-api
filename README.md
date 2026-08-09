@@ -85,24 +85,54 @@ regenerated and audited.
    openssl rand -hex 16
    ```
 
-3. Start the services:
-   ```bash
-   docker compose up -d
-   ```
-
-4. Run migrations:
+3. Run migrations:
    ```bash
    docker compose --profile migrate up migrate
    ```
 
+4. Start the services:
+   ```bash
+   docker compose up -d
+   ```
+
+### Running without Docker
+
+Compose is one way to run this, not the only one, and the Dockerfile is not
+required. Under a process supervisor the same rules apply:
+
+- Build first — `npm ci && npm run build` — then run `dist/server.js`.
+- **Run migrations before the app starts**, not beside it. A pre-start hook is
+  the right place for them, and letting a migration failure block startup is
+  deliberate: serving against a stale schema is worse than not serving.
+- The migration CLI needs an action verb. `node-pg-migrate -m migrations up`,
+  or `npm run migrate up`, which is the same thing.
+- Everything is read from the environment; the app never opens a config file.
+  A supervisor can therefore hold the secrets in a file the service user cannot
+  read and pass them in.
+
 ### Updating
 
-To update the deployment:
+Run migrations *before* bringing the new code up:
+
 ```bash
-git pull && docker compose up -d --build
+git pull
+docker compose --profile migrate up migrate
+docker compose up -d --build
 ```
 
-This is safe - database data persists in the Docker volume.
+The order matters: a release can depend on a column its migration has already
+adjusted, so starting the new code first leaves writes failing until the
+migration catches up. Migrations here are written so the previous release still
+works against the new schema, which is what keeps a rollback possible.
+
+Under a supervisor that runs migrations as a pre-start hook, a rebuild and
+restart already does both in that order.
+
+Database data persists in the Docker volume.
+
+Config is checked at startup, so a missing or malformed value stops the
+container immediately and lists every problem at once. If the API doesn't come
+up after an update, read the first lines of `docker compose logs api`.
 
 ## Environment Variables
 
@@ -121,6 +151,10 @@ This is safe - database data persists in the Docker volume.
 | `RATE_LIMIT_WINDOW` | No | Rate limit window (default: `1 minute`) |
 | `RATE_LIMIT_CREATE_MAX` | No | Paylink creations per window (default: 20) |
 | `RATE_LIMIT_REQUEST_MAX` | No | Donation requests per paylink per window (default: 60) |
+| `RATE_LIMIT_DELETE_MAX` | No | Deletions per window, single and bulk (default: 20) |
+| `REQUEST_TIMEOUT_MS` | No | Time to receive a whole request (default: 30000) |
+| `CONNECTION_TIMEOUT_MS` | No | Socket inactivity before close (default: 30000) |
+| `KEEP_ALIVE_TIMEOUT_MS` | No | Idle keep-alive socket lifetime (default: 15000) |
 | `ENABLE_HSTS` | No | Send Strict-Transport-Security. Off by default |
 | `HSTS_MAX_AGE` | No | HSTS duration in seconds (default: 31536000) |
 | `HSTS_INCLUDE_SUBDOMAINS` | No | Extend HSTS to every subdomain. Off by default |
@@ -231,6 +265,10 @@ Content-Type: application/json
   donations nobody can spend.
 - Owner keys are computed in the browser; only the resulting hash reaches this
   service, so deleting a paylink never puts a view key back on the wire.
+- The recipient's own address is not kept either. It is used to derive the
+  address pool and compute the owner key, both before the row is written, and
+  nothing reads it afterwards — so a database dump cannot say who a paylink
+  belongs to.
 - Every `/api/paylinks` response is held to the same minimum time plus jitter —
   success, not found, and error alike — so an existing paylink cannot be told
   from a missing one by timing the reply.

@@ -20,6 +20,7 @@ import {
   deriveSubaddressRange,
   warmup as warmupMoneroAddressing,
 } from "./monero/address";
+import { loadConfig } from "./config";
 import crypto from "crypto";
 
 const MAX_SUBADDRESS_INDEX = 1_000_000;
@@ -32,32 +33,6 @@ const DEFAULT_MAX_INDEX = 100;
 // thousand costs about 400ms and 93KB. The donate page requests exactly one
 // address per visit, so this is a generous ceiling rather than a tight one.
 const MAX_POOL_SIZE = 1_000;
-
-function getAllowedOrigins(): string[] | true {
-  const env = process.env.ALLOWED_ORIGINS;
-  if (!env || env === "*") {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("ALLOWED_ORIGINS must be set in production (not '*')");
-    }
-    return true; // Allow all in development
-  }
-  return env
-    .split(",")
-    .map((o) => o.trim())
-    .filter(Boolean);
-}
-
-function getDonateBaseUrl(): string {
-  const env = process.env.DONATE_BASE_URL;
-  if (!env) {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("DONATE_BASE_URL must be set in production");
-    }
-    return "https://anonomi.org/paylinks/d#"; // Default for development
-  }
-  // Ensure it ends with # for the fragment identifier
-  return env.endsWith("#") ? env : `${env}#`;
-}
 
 // --- Schemas ---
 const PaylinkOptionsSchema = z
@@ -124,14 +99,10 @@ function normalizeRange(
   return { lo, hi };
 }
 
-function computePaylinkFingerprint(paylinkId: string) {
-  const key = process.env.PAYLINKS_FINGERPRINT_KEY;
-  if (!key || key.length < 16) {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error(
-        "PAYLINKS_FINGERPRINT_KEY must be set (>=16 chars) in production",
-      );
-    }
+// Key comes from the config, resolved at boot. Absent outside production, where
+// the fingerprint falls back to a plain hash so dev needs no secrets.
+function computePaylinkFingerprint(paylinkId: string, key: string | null) {
+  if (!key) {
     return crypto
       .createHash("sha256")
       .update(paylinkId)
@@ -208,48 +179,7 @@ async function padToFloor(startedAtMs: number): Promise<void> {
 // client address is in X-Forwarded-For.
 //
 // Guessing wrong in either direction is harmful, so nothing here is inferred.
-
-/**
- * Whether to believe X-Forwarded-For, and how far down it to look.
- *
- * Off unless explicitly set. Trusting that header with no proxy in front lets
- * any client claim any address, which forges the rate-limit key and removes the
- * limit altogether - a worse failure than the one it fixes.
- *
- * Accepts "true", a hop count, or a comma-separated list of trusted addresses
- * or subnets, all of which Fastify understands directly.
- */
-function getTrustProxy(): boolean | number | string {
-  const raw = process.env.TRUST_PROXY?.trim();
-  if (!raw || raw === "false") return false;
-  if (raw === "true") return true;
-
-  const hops = Number(raw);
-  if (Number.isInteger(hops) && hops >= 0) return hops;
-
-  return raw;
-}
-
-function envPositiveInt(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) return fallback;
-  const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : fallback;
-}
-
-// Applies to the endpoints that only read: cheap, so the ceiling is generous.
-const RATE_LIMIT_MAX = envPositiveInt("RATE_LIMIT_MAX", 120);
-const RATE_LIMIT_WINDOW = process.env.RATE_LIMIT_WINDOW?.trim() || "1 minute";
-
-// Creating a paylink derives its whole address pool: up to ~400ms of CPU and
-// ~93KB at the cap, unauthenticated. It needs a far tighter budget than a read,
-// and on a hidden service - where an abuser cannot be identified, let alone
-// blocked - this limit is the only thing standing in front of that cost.
-const RATE_LIMIT_CREATE_MAX = envPositiveInt("RATE_LIMIT_CREATE_MAX", 20);
-
-// Keyed per paylink rather than per caller, so one link cannot have its whole
-// address pool harvested. A donation page spends exactly one of these per visit.
-const RATE_LIMIT_REQUEST_MAX = envPositiveInt("RATE_LIMIT_REQUEST_MAX", 60);
+// The values live in src/config.ts.
 
 function computeOwnerKey(publicAddress: string, privateViewKey: string) {
   return crypto
@@ -259,6 +189,10 @@ function computeOwnerKey(publicAddress: string, privateViewKey: string) {
 }
 
 async function main() {
+  // Before anything else, so a missing value stops the service here rather than
+  // part-way through someone's donation.
+  const config = loadConfig();
+
   const app = Fastify({
     logger: {
       level: "info",
@@ -286,12 +220,20 @@ async function main() {
     // is not worth an access log.
     disableRequestLogging: true,
     bodyLimit: 16384, // 16KB max body size
-    trustProxy: getTrustProxy(),
+    trustProxy: config.trustProxy,
+
+    // Both off by default in Fastify, so a client could open a connection, send
+    // half a request and sit on it. The response-time floor below makes that
+    // cheaper still, since every reply holds its connection for at least
+    // MIN_RESPONSE_TIME_MS.
+    requestTimeout: config.timeouts.request,
+    connectionTimeout: config.timeouts.connection,
+    keepAliveTimeout: config.timeouts.keepAlive,
   });
 
   // CORS configuration
-  const allowedOrigins = getAllowedOrigins();
-  const allowNullOrigin = process.env.ALLOW_NULL_ORIGIN === "true";
+  const allowedOrigins = config.allowedOrigins;
+  const allowNullOrigin = config.allowNullOrigin;
 
   // Security headers - configured for JSON API (not HTML)
   // Disabled headers that can interfere with CORS/Tor
@@ -307,10 +249,6 @@ async function main() {
   // so the only way back is serving max-age=0 and waiting for every client to
   // return. includeSubDomains is separate for the same reason: it commits every
   // sibling host, which is not a decision to inherit from a default.
-  const enableHsts = process.env.ENABLE_HSTS === "true";
-  const hstsMaxAge = envPositiveInt("HSTS_MAX_AGE", 31_536_000);
-  const hstsIncludeSubDomains = process.env.HSTS_INCLUDE_SUBDOMAINS === "true";
-
   await app.register(helmet, {
     contentSecurityPolicy: false, // API doesn't serve HTML
     crossOriginEmbedderPolicy: false, // Can interfere with CORS
@@ -319,10 +257,10 @@ async function main() {
     originAgentCluster: false, // Not relevant for API
     dnsPrefetchControl: { allow: false },
     frameguard: { action: "deny" },
-    hsts: enableHsts
+    hsts: config.hsts.enabled
       ? {
-          maxAge: hstsMaxAge,
-          includeSubDomains: hstsIncludeSubDomains,
+          maxAge: config.hsts.maxAge,
+          includeSubDomains: config.hsts.includeSubDomains,
           preload: false,
         }
       : false,
@@ -360,8 +298,8 @@ async function main() {
   // property of Tor, not something configuration can fix - the per-route limits
   // below are what carry the load there.
   await app.register(rateLimit, {
-    max: RATE_LIMIT_MAX,
-    timeWindow: RATE_LIMIT_WINDOW,
+    max: config.rateLimit.max,
+    timeWindow: config.rateLimit.window,
   });
 
   // Response-time floor, applied to every paylink response in one place.
@@ -422,7 +360,7 @@ async function main() {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
-      const fingerprint = computePaylinkFingerprint(id);
+      const fingerprint = computePaylinkFingerprint(id, config.fingerprintKey);
 
       return reply.code(200).send({
         paylinkId: id,
@@ -446,8 +384,8 @@ async function main() {
     {
       config: {
         rateLimit: {
-          max: RATE_LIMIT_CREATE_MAX,
-          timeWindow: RATE_LIMIT_WINDOW,
+          max: config.rateLimit.createMax,
+          timeWindow: config.rateLimit.window,
         },
       },
     },
@@ -588,9 +526,10 @@ async function main() {
       try {
         await client.query("BEGIN");
 
+        // No publicAddress: it has done its work above, and storing it would
+        // only keep the one field tying a paylink to its owner.
         const id = await insertPaylink(client, {
           label,
-          publicAddress,
           genMode,
           minIndex,
           maxIndex,
@@ -601,12 +540,15 @@ async function main() {
 
         await client.query("COMMIT");
 
-        const donateUrl = `${getDonateBaseUrl()}${id}`;
+        const donateUrl = `${config.donateBaseUrl}${id}`;
         const embedHtml =
           `<!-- Anonomi Paylinks -->\n` +
           `<a href="${donateUrl}" rel="nofollow noopener" target="_blank">Donate XMR</a>\n`;
 
-        const fingerprint = computePaylinkFingerprint(id);
+        const fingerprint = computePaylinkFingerprint(
+          id,
+          config.fingerprintKey,
+        );
 
         return reply.code(201).send({
           id,
@@ -630,80 +572,107 @@ async function main() {
   );
 
   // DELETE ONE (hard delete by id + ownerKey)
-  app.post("/api/paylinks/:id/delete", async (req, reply) => {
-    const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
-    if (!idResult.success) {
-      // Same response as success - no info leakage about ID validity
-      return reply.code(200).send({
-        ok: true,
-        message: genericDeleteMessageSingle((req.params as any)?.id ?? ""),
-      });
-    }
-    const id = idResult.data;
+  //
+  // Destructive, so it gets a tighter ceiling than the generic read limit -
+  // still loose enough to clean up a handful of links by hand.
+  app.post(
+    "/api/paylinks/:id/delete",
+    {
+      config: {
+        rateLimit: {
+          max: config.rateLimit.deleteMax,
+          timeWindow: config.rateLimit.window,
+        },
+      },
+    },
+    async (req, reply) => {
+      const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
+      if (!idResult.success) {
+        // Same response as success - no info leakage about ID validity
+        return reply.code(200).send({
+          ok: true,
+          message: genericDeleteMessageSingle((req.params as any)?.id ?? ""),
+        });
+      }
+      const id = idResult.data;
 
-    const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply
-        .code(400)
-        .send({ error: "invalid_request", details: parsed.error.flatten() });
-    }
+      const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send({ error: "invalid_request", details: parsed.error.flatten() });
+      }
 
-    const { ownerKey } = parsed.data;
+      const { ownerKey } = parsed.data;
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
-      // Only deletes if BOTH match.
-      await deletePaylinkByIdAndOwner(client, id, ownerKey);
+        // Only deletes if BOTH match.
+        await deletePaylinkByIdAndOwner(client, id, ownerKey);
 
-      await client.query("COMMIT");
+        await client.query("COMMIT");
 
-      // Always 200, never indicates if it existed or matched
-      return reply.code(200).send({
-        ok: true,
-        message: genericDeleteMessageSingle(id),
-      });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      req.log.error({ err }, "delete paylink failed");
+        // Always 200, never indicates if it existed or matched
+        return reply.code(200).send({
+          ok: true,
+          message: genericDeleteMessageSingle(id),
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        req.log.error({ err }, "delete paylink failed");
 
-      return reply.code(500).send({ error: "internal_error" });
-    } finally {
-      client.release();
-    }
-  });
+        return reply.code(500).send({ error: "internal_error" });
+      } finally {
+        client.release();
+      }
+    },
+  );
 
-  app.post("/api/paylinks/delete", async (req, reply) => {
-    const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply
-        .code(400)
-        .send({ error: "invalid_request", details: parsed.error.flatten() });
-    }
+  // DELETE ALL for an owner key. One request wipes everything that key owns, so
+  // nobody legitimate needs to repeat it and the limit costs nothing.
+  app.post(
+    "/api/paylinks/delete",
+    {
+      config: {
+        rateLimit: {
+          max: config.rateLimit.deleteMax,
+          timeWindow: config.rateLimit.window,
+        },
+      },
+    },
+    async (req, reply) => {
+      const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply
+          .code(400)
+          .send({ error: "invalid_request", details: parsed.error.flatten() });
+      }
 
-    const { ownerKey } = parsed.data;
+      const { ownerKey } = parsed.data;
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
 
-      await deletePaylinksByOwner(client, ownerKey);
+        await deletePaylinksByOwner(client, ownerKey);
 
-      await client.query("COMMIT");
+        await client.query("COMMIT");
 
-      return reply.code(200).send({
-        ok: true,
-        message: genericDeleteMessageBulk(),
-      });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      req.log.error({ err }, "bulk delete paylinks failed");
-      return reply.code(500).send({ error: "internal_error" });
-    } finally {
-      client.release();
-    }
-  });
+        return reply.code(200).send({
+          ok: true,
+          message: genericDeleteMessageBulk(),
+        });
+      } catch (err) {
+        await client.query("ROLLBACK");
+        req.log.error({ err }, "bulk delete paylinks failed");
+        return reply.code(500).send({ error: "internal_error" });
+      } finally {
+        client.release();
+      }
+    },
+  );
 
   // Donor requests a payment payload (random index each time)
   //
@@ -718,8 +687,8 @@ async function main() {
     {
       config: {
         rateLimit: {
-          max: RATE_LIMIT_REQUEST_MAX,
-          timeWindow: RATE_LIMIT_WINDOW,
+          max: config.rateLimit.requestMax,
+          timeWindow: config.rateLimit.window,
           keyGenerator: (req: FastifyRequest) =>
             `${req.ip}:${(req.params as any)?.id ?? ""}`,
         },
@@ -778,7 +747,10 @@ async function main() {
           description: description || undefined,
         });
 
-        const fingerprint = computePaylinkFingerprint(id);
+        const fingerprint = computePaylinkFingerprint(
+          id,
+          config.fingerprintKey,
+        );
 
         return reply.code(200).send({
           paylinkId: id,
@@ -803,9 +775,7 @@ async function main() {
   // install fails at boot rather than on someone's donation.
   await warmupMoneroAddressing();
 
-  const port = Number(process.env.PORT ?? 8787);
-  const host = process.env.HOST ?? "0.0.0.0";
-  await app.listen({ port, host });
+  await app.listen({ port: config.port, host: config.host });
 }
 
 main().catch((err) => {
