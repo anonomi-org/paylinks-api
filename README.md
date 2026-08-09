@@ -116,6 +116,38 @@ This is safe - database data persists in the Docker volume.
 | `ALLOW_NULL_ORIGIN` | No | Set to `true` for Tor deployments (see below) |
 | `DONATE_BASE_URL` | Yes | Base URL for donation page (e.g., `https://example.org/donate#`) |
 | `NODE_ENV` | No | Set to `production` for strict validation |
+| `TRUST_PROXY` | No | Trust `X-Forwarded-For`. Off by default — see below |
+| `RATE_LIMIT_MAX` | No | Read requests per window (default: 120) |
+| `RATE_LIMIT_WINDOW` | No | Rate limit window (default: `1 minute`) |
+| `RATE_LIMIT_CREATE_MAX` | No | Paylink creations per window (default: 20) |
+| `RATE_LIMIT_REQUEST_MAX` | No | Donation requests per paylink per window (default: 60) |
+| `ENABLE_HSTS` | No | Send Strict-Transport-Security. Off by default |
+| `HSTS_MAX_AGE` | No | HSTS duration in seconds (default: 31536000) |
+| `HSTS_INCLUDE_SUBDOMAINS` | No | Extend HSTS to every subdomain. Off by default |
+
+## Deployment shape
+
+This service runs two very different ways and cannot tell which one it is in,
+so a few settings have to be declared rather than guessed.
+
+**Behind a reverse proxy (typical clearnet self-hosting).** Set
+`TRUST_PROXY=true` — or a hop count, or a list of trusted addresses. Without it
+every client appears to come from the proxy and they all share a single rate
+limit bucket. Turning it on when there is *no* proxy in front is worse than
+leaving it off: any caller can then claim any address and bypass rate limiting
+entirely. Set `ENABLE_HSTS=true` if you terminate TLS here rather than at the
+proxy.
+
+**As a Tor hidden service.** Leave `TRUST_PROXY` unset and `ENABLE_HSTS` off,
+and set `ALLOW_NULL_ORIGIN=true`. Every request arrives from the local Tor
+daemon, so there is no client address to recover and per-client rate limiting
+is not possible — that is Tor working as intended, not a misconfiguration. The
+global limit becomes a service-wide ceiling, and `RATE_LIMIT_CREATE_MAX` is
+what actually protects you, since an abuser can be neither identified nor
+blocked. Size it deliberately.
+
+**Directly exposed on the clearnet.** Leave `TRUST_PROXY` unset; `req.ip` is
+already the real client address.
 
 ## Tor Deployment
 
