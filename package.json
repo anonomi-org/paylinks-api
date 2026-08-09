@@ -9,7 +9,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p .",
     "start": "node dist/server.js",
-    "migrate": "node-pg-migrate -d $DATABASE_URL -m migrations",
+    "migrate": "node-pg-migrate -m migrations",
     "migrate:create": "node-pg-migrate create"
   },
   "repository": {

@@ -21,10 +21,10 @@ export async function createTestDb(): Promise<TestDb> {
   // Both packages are ESM-only and this file is CommonJS, so they are pulled
   // in dynamically rather than with a top-level import.
   const { PGlite } = await import("@electric-sql/pglite");
-  const { pgcrypto } = await import("@electric-sql/pglite/contrib/pgcrypto");
   const { runner } = await import("node-pg-migrate");
 
-  const pg = new PGlite({ extensions: { pgcrypto } });
+  // No extensions: the schema deliberately relies only on core Postgres.
+  const pg = new PGlite();
   await pg.waitReady;
 
   // node-pg-migrate drives a pg-shaped client; PGlite's query() is close
