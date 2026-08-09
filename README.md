@@ -5,7 +5,7 @@ A privacy-focused API for creating Monero donation links with subaddress generat
 ## Features
 
 - **Subaddress Generation**: Automatically generates unique Monero subaddresses for each donation
-- **View Key Encryption**: Private view keys are encrypted at rest using AES-256-GCM
+- **No Stored View Keys**: Subaddresses are derived when a paylink is created and the private view key is discarded — it is never written to the database
 - **Rate Limiting**: Built-in protection against abuse
 - **Tor Support**: Full support for Tor hidden service deployments
 - **No Tracking**: No analytics, no cookies, no logs of sensitive data
@@ -50,6 +50,22 @@ A privacy-focused API for creating Monero donation links with subaddress generat
    npm run dev
    ```
 
+## Tests
+
+```bash
+npm test        # unit + database tests
+npm run typecheck
+```
+
+Nothing needs to be running first. The database tests spin up PGlite — real
+PostgreSQL compiled to WebAssembly — in-process, apply the migrations from
+`migrations/`, and exercise the same query functions the handlers call. No
+Docker, no service container, no `DATABASE_URL`.
+
+The Monero test vectors in `test/vectors.ts` were generated from a throwaway
+seed that is committed alongside them, so every expected address can be
+regenerated and audited.
+
 ## Production Deployment
 
 ### Using Docker Compose
@@ -62,9 +78,6 @@ A privacy-focused API for creating Monero donation links with subaddress generat
 
 2. Generate required secrets:
    ```bash
-   # Encryption key for view keys
-   openssl rand -base64 32
-
    # Fingerprint HMAC key
    openssl rand -hex 32
 
@@ -98,7 +111,6 @@ This is safe - database data persists in the Docker volume.
 | `PORT` | No | API port (default: 8787) |
 | `HOST` | No | Bind address (default: 0.0.0.0) |
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `PAYLINKS_MASTER_KEY_B64` | Yes | Base64-encoded 32-byte AES key for encrypting view keys |
 | `PAYLINKS_FINGERPRINT_KEY` | Yes | HMAC key for paylink fingerprints (min 16 chars) |
 | `ALLOWED_ORIGINS` | Yes | Comma-separated list of allowed CORS origins |
 | `ALLOW_NULL_ORIGIN` | No | Set to `true` for Tor deployments (see below) |
@@ -177,11 +189,23 @@ Content-Type: application/json
 
 ## Security
 
-- Private view keys are encrypted using AES-256-GCM before storage
-- Owner keys are derived from public address + private view key (never stored directly)
-- Delete operations use constant-time responses to prevent enumeration
-- UUID validation prevents timing attacks on paylink IDs
-- Rate limiting protects against brute force attacks
+- Private view keys are never stored. A paylink's subaddresses are derived once,
+  while the key is still in the request, and the key is discarded before the
+  response is sent. Compromising this service does not yield anything that can
+  reconstruct a recipient's or a donor's payment history.
+- Addresses are validated with `monero-ts`: checksum, network, address type, and
+  that the submitted view key genuinely belongs to the submitted address. A
+  mistyped view key is rejected rather than silently producing a paylink whose
+  donations nobody can spend.
+- Owner keys are computed in the browser; only the resulting hash reaches this
+  service, so deleting a paylink never puts a view key back on the wire.
+- Every `/api/paylinks` response is held to the same minimum time plus jitter —
+  success, not found, and error alike — so an existing paylink cannot be told
+  from a missing one by timing the reply.
+- Request logging is off. The paylink id and the caller's address are never
+  written to a log, which is what keeps the donate page's URL-fragment design
+  meaningful.
+- A global rate limit of 120 requests per minute is applied per client IP.
 
 ## License
 

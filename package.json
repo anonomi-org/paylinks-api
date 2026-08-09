@@ -4,11 +4,12 @@
   "description": "",
   "main": "dist/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "tsx --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p .",
     "start": "node dist/server.js",
-    "migrate": "node-pg-migrate -d $DATABASE_URL -m migrations",
+    "migrate": "node-pg-migrate -m migrations",
     "migrate:create": "node-pg-migrate create"
   },
   "repository": {
@@ -30,10 +31,10 @@
     "fastify": "^5.7.2",
     "monero-ts": "^0.11.8",
     "pg": "^8.17.2",
-    "subaddress": "^1.0.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4",
     "@types/node": "^25.1.0",
     "eslint": "^9.39.2",
     "node-pg-migrate": "^8.0.4",

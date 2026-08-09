@@ -3,8 +3,9 @@ import type { MigrationBuilder } from "node-pg-migrate";
 const MAX_INDEX = 1_000_000;
 
 export async function up(pgm: MigrationBuilder): Promise<void> {
-  // Ensure pgcrypto for gen_random_uuid()
-  pgm.sql(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
+  // gen_random_uuid() has been in core since PostgreSQL 13, so no extension is
+  // needed. Creating pgcrypto here only added a privilege requirement that a
+  // locked-down database role may not have.
 
   pgm.createTable("paylinks", {
     id: {

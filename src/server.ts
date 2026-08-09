@@ -1,19 +1,40 @@
-import Fastify from "fastify";
+import Fastify, {
+  type FastifyError,
+  type FastifyRequest,
+} from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { z } from "zod";
 import { pool } from "./db";
-import { encryptViewKey, decryptViewKey } from "./crypto";
 import { buildMoneroUri } from "./moneroUri";
-import { decodeStandardAddress } from "./monero/decodeAddress";
-import * as subaddress from "subaddress";
+import {
+  deletePaylinkByIdAndOwner,
+  deletePaylinksByOwner,
+  findPaylinkForRequest,
+  findPaylinkMeta,
+  findSubaddress,
+  insertPaylink,
+  insertSubaddresses,
+} from "./store";
+import {
+  assertValidPrimaryAddressAndViewKey,
+  deriveSubaddressRange,
+  warmup as warmupMoneroAddressing,
+} from "./monero/address";
 import crypto from "crypto";
 
 const MAX_SUBADDRESS_INDEX = 1_000_000;
 const DEFAULT_MIN_INDEX = 1;
 const DEFAULT_MAX_INDEX = 100;
+
+// How many addresses a single paylink may reserve. Subaddresses are derived up
+// front so the view key never has to be stored, which turns the index range
+// into real work and storage: roughly 0.4ms and 95 bytes per address, so a
+// thousand costs about 400ms and 93KB. The donate page requests exactly one
+// address per visit, so this is a generous ceiling rather than a tight one.
+const MAX_POOL_SIZE = 1_000;
 
 function getAllowedOrigins(): string[] | true {
   const env = process.env.ALLOWED_ORIGINS;
@@ -49,8 +70,13 @@ const PaylinkOptionsSchema = z
   .optional();
 
 const CreatePaylinkSchema = z.object({
+  // Shape only. Whether these are a genuine mainnet primary address and its
+  // matching view key is decided in src/monero/address.ts, not here.
   publicAddress: z.string().trim().min(20).max(200),
-  privateViewKey: z.string().trim().min(20).max(200),
+  privateViewKey: z
+    .string()
+    .trim()
+    .regex(/^[0-9a-f]{64}$/i, "privateViewKey must be 64 hex chars"),
   options: PaylinkOptionsSchema,
 });
 
@@ -136,21 +162,35 @@ function genericDeleteMessageBulk() {
 // Generic error that doesn't reveal if paylink exists, is inactive, or deleted
 const PAYLINK_UNAVAILABLE_ERROR = { error: "paylink_unavailable" } as const;
 
-// Minimum response time to prevent timing attacks
-// Ensures total response time is at least minMs, with jitter
+// Response-time floor for the paylink API.
+//
+// Every paylink response is held to at least MIN_RESPONSE_TIME_MS and then
+// given jitter on top, so a caller cannot tell an existing paylink from a
+// missing one, or a matching owner key from a wrong one, by timing the reply.
+//
+// This is applied in an onSend hook rather than at each return statement. The
+// previous version padded only the not-found branches, which left the success
+// paths answering in single-digit milliseconds and preserved the exact
+// enumeration signal the padding was meant to remove.
 const MIN_RESPONSE_TIME_MS = 200;
+const MAX_JITTER_MS = 100;
 
-async function ensureMinimumTime<T>(
-  startTime: number,
-  result: T,
-): Promise<T> {
-  const elapsed = Date.now() - startTime;
-  if (elapsed < MIN_RESPONSE_TIME_MS) {
-    // Add remaining time plus random jitter (0-100ms)
-    const remaining = MIN_RESPONSE_TIME_MS - elapsed + crypto.randomInt(0, 100);
-    await new Promise((r) => setTimeout(r, remaining));
-  }
-  return result;
+/** Wall clock can step backwards; hrtime cannot, so the pad stays bounded. */
+function monotonicNowMs(): number {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+async function padToFloor(startedAtMs: number): Promise<void> {
+  const elapsed = monotonicNowMs() - startedAtMs;
+
+  // Jitter is added unconditionally rather than only when the response came in
+  // under the floor. A response that already took longer than the floor is
+  // exactly the case where the underlying work was slow enough for its timing
+  // to say something, so it needs noise too.
+  const toFloor = Math.max(MIN_RESPONSE_TIME_MS - elapsed, 0);
+  const jitter = crypto.randomInt(0, MAX_JITTER_MS + 1); // 0-100 inclusive
+
+  await new Promise((r) => setTimeout(r, toFloor + jitter));
 }
 
 function computeOwnerKey(publicAddress: string, privateViewKey: string) {
@@ -165,15 +205,28 @@ async function main() {
     logger: {
       level: "info",
       redact: {
+        // Fastify's own request logging never carried a body, so the previous
+        // "req.body.*" paths could not match anything. These are the shapes an
+        // explicit log call would actually produce, so they fire if someone
+        // later writes req.log.info({ body }) or logs a field directly.
         paths: [
-          "req.body.ownerKey",
-          "req.body.privateViewKey",
-          "req.body.publicAddress",
+          "ownerKey",
+          "privateViewKey",
+          "publicAddress",
+          "body.ownerKey",
+          "body.privateViewKey",
+          "body.publicAddress",
         ],
         remove: true,
       },
     },
-    disableRequestLogging: false,
+    // The donate page keeps the paylink id in the URL fragment specifically so
+    // it never reaches a server log. Fastify's request logging would undo that:
+    // it writes the id - which is in the API path - next to the caller's IP on
+    // every hit, producing exactly the access record the fragment avoids. On a
+    // service that offers Tor deployment and advertises no tracking, that trade
+    // is not worth an access log.
+    disableRequestLogging: true,
     bodyLimit: 16384, // 16KB max body size
   });
 
@@ -225,43 +278,64 @@ async function main() {
   // Global rate limit
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
 
+  // Response-time floor, applied to every paylink response in one place.
+  //
+  // onSend runs after the handler has returned, which means the padding no
+  // longer happens while the handler still holds a database client. The old
+  // per-route version slept inside the try block that owned the connection, so
+  // a handful of concurrent requests could empty the pool for a quarter second.
+  const requestStart = new WeakMap<FastifyRequest, number>();
+
+  const isPaddedRoute = (req: FastifyRequest) =>
+    req.method !== "OPTIONS" && req.url.startsWith("/api/paylinks");
+
+  app.addHook("onRequest", async (req) => {
+    if (isPaddedRoute(req)) requestStart.set(req, monotonicNowMs());
+  });
+
+  app.addHook("onSend", async (req, _reply, payload) => {
+    const startedAt = requestStart.get(req);
+    if (startedAt !== undefined) await padToFloor(startedAt);
+    return payload;
+  });
+
+  // Fastify gates its default 5xx log behind disableRequestLogging, so turning
+  // request logging off would otherwise leave server errors completely silent.
+  // Its default handler also logs the serialized request, which would put the
+  // paylink id and the caller's IP straight back into the log we just removed.
+  // Log the error on its own instead: enough to diagnose a fault, nothing that
+  // records who asked for which paylink.
+  app.setErrorHandler((err: FastifyError, req, reply) => {
+    const statusCode = err.statusCode ?? 500;
+
+    if (statusCode >= 500) {
+      req.log.error({ err }, "request failed");
+      return reply.code(500).send({ error: "internal_error" });
+    }
+
+    return reply.code(statusCode).send(err);
+  });
+
   app.get("/health", async () => ({ ok: true }));
 
   // PUBLIC METADATA (used by donation page on load)
   // Returns label + fingerprint
   app.get("/api/paylinks/:id/meta", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
 
     const client = await pool.connect();
     try {
-      const r = await client.query<{
-        label: string | null;
-        active: boolean;
-        deleted_at: string | null;
-      }>(
-        `
-      SELECT label, active, deleted_at
-      FROM paylinks
-      WHERE id = $1
-      LIMIT 1
-      `,
-        [id],
-      );
+      const row = await findPaylinkMeta(client, id);
 
       // Same response for not found, inactive, or deleted - no info leakage
-      if (r.rowCount !== 1 || !r.rows[0]!.active || r.rows[0]!.deleted_at) {
-        await ensureMinimumTime(startTime, null);
+      if (!row || !row.active || row.deleted_at) {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
 
-      const row = r.rows[0]!;
       const fingerprint = computePaylinkFingerprint(id);
 
       return reply.code(200).send({
@@ -359,28 +433,52 @@ async function main() {
     const minIndex = clampIndex(lo);
     const maxIndex = clampIndex(hi);
 
-    // Compute preview so the user can sanity-check in their wallet UI
-    let addressPreview: string | null = null;
-
-    try {
-      const decoded = decodeStandardAddress(publicAddress);
-
-      const addrAtMin = subaddress.getSubaddress(
-        privateViewKey,
-        decoded.publicSpendKeyHex,
-        0,
-        minIndex,
-      );
-
-      addressPreview = previewAddr(addrAtMin);
-    } catch {
+    // Every subaddress is derived up front, so the range is also the amount of
+    // work and storage a single request can ask for. The indices themselves may
+    // still be large; it is the count that has to stay bounded.
+    const poolSize = maxIndex - minIndex + 1;
+    if (poolSize > MAX_POOL_SIZE) {
       return reply.code(400).send({
         error: "invalid_request",
-        details: { publicAddress: ["Invalid Monero primary address."] },
+        details: {
+          options: {
+            maxIndex: [
+              `minIndex and maxIndex may span at most ${MAX_POOL_SIZE} addresses (requested ${poolSize})`,
+            ],
+          },
+        },
       });
     }
 
-    const { ciphertextB64, nonceB64 } = encryptViewKey(privateViewKey);
+    // Derive the whole pool now, while the view key is in hand. After this
+    // request the key is gone - it is never written to the database, so a
+    // compromise of this service cannot reconstruct anybody's payment history.
+    let subaddresses: { index: number; address: string }[];
+    try {
+      // Rejects a bad checksum, a subaddress, the wrong network, a malleated
+      // encoding, and - the one that used to lose money silently - a view key
+      // that does not belong to this address.
+      await assertValidPrimaryAddressAndViewKey(publicAddress, privateViewKey);
+
+      subaddresses = await deriveSubaddressRange(
+        publicAddress,
+        privateViewKey,
+        minIndex,
+        maxIndex,
+      );
+    } catch {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: {
+          publicAddress: [
+            "Not a valid Monero mainnet address, or the view key does not match it.",
+          ],
+        },
+      });
+    }
+
+    // Preview so the user can sanity-check the first address in their wallet.
+    const addressPreview = previewAddr(subaddresses[0]!.address);
 
     const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
 
@@ -388,35 +486,16 @@ async function main() {
     try {
       await client.query("BEGIN");
 
-      const insertRes = await client.query<{ id: string }>(
-        `
-        INSERT INTO paylinks (
-          label,
-          public_address,
-          encrypted_view_key,
-          encryption_nonce,
-          gen_mode,
-          min_index,
-          max_index,
-          owner_key
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        RETURNING id
-        `,
-        [
-          label,
-          publicAddress,
-          ciphertextB64,
-          nonceB64,
-          genMode,
-          minIndex,
-          maxIndex,
-          ownerKey,
-        ],
-      );
+      const id = await insertPaylink(client, {
+        label,
+        publicAddress,
+        genMode,
+        minIndex,
+        maxIndex,
+        ownerKey,
+      });
 
-      const id = insertRes.rows[0]?.id;
-      if (!id) throw new Error("Failed to create paylink");
+      await insertSubaddresses(client, id, subaddresses);
 
       await client.query("COMMIT");
 
@@ -449,11 +528,8 @@ async function main() {
 
   // DELETE ONE (hard delete by id + ownerKey)
   app.post("/api/paylinks/:id/delete", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       // Same response as success - no info leakage about ID validity
       return reply.code(200).send({
         ok: true,
@@ -476,18 +552,9 @@ async function main() {
       await client.query("BEGIN");
 
       // Only deletes if BOTH match.
-      await client.query(
-        `
-      DELETE FROM paylinks
-      WHERE id = $1 AND owner_key = $2
-      `,
-        [id, ownerKey],
-      );
+      await deletePaylinkByIdAndOwner(client, id, ownerKey);
 
       await client.query("COMMIT");
-
-      // Ensure minimum response time to prevent timing attacks
-      await ensureMinimumTime(startTime, null);
 
       // Always 200, never indicates if it existed or matched
       return reply.code(200).send({
@@ -505,8 +572,6 @@ async function main() {
   });
 
   app.post("/api/paylinks/delete", async (req, reply) => {
-    const startTime = Date.now();
-
     const parsed = DeleteByOwnerKeySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply
@@ -520,17 +585,10 @@ async function main() {
     try {
       await client.query("BEGIN");
 
-      await client.query(
-        `
-      DELETE FROM paylinks
-      WHERE owner_key = $1
-      `,
-        [ownerKey],
-      );
+      await deletePaylinksByOwner(client, ownerKey);
 
       await client.query("COMMIT");
 
-      await ensureMinimumTime(startTime, null);
 
       return reply.code(200).send({
         ok: true,
@@ -547,11 +605,8 @@ async function main() {
 
   // Donor requests a payment payload (random index each time)
   app.post("/api/paylinks/:id/request", async (req, reply) => {
-    const startTime = Date.now();
-
     const idResult = PaylinkIdSchema.safeParse((req.params as any)?.id);
     if (!idResult.success) {
-      await ensureMinimumTime(startTime, null);
       return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
     }
     const id = idResult.data;
@@ -567,42 +622,12 @@ async function main() {
 
     const client = await pool.connect();
     try {
-      const paylinkRes = await client.query<{
-        label: string;
-        public_address: string;
-        encrypted_view_key: string;
-        encryption_nonce: string;
-        active: boolean;
-        deleted_at: string | null;
-        gen_mode: string;
-        min_index: number;
-        max_index: number;
-      }>(
-        `
-        SELECT
-          label,
-          public_address,
-          encrypted_view_key,
-          encryption_nonce,
-          active,
-          deleted_at,
-          gen_mode,
-          min_index,
-          max_index
-        FROM paylinks
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [id],
-      );
+      const paylink = await findPaylinkForRequest(client, id);
 
       // Same response for not found, inactive, or deleted - no info leakage
-      if (paylinkRes.rowCount !== 1 || !paylinkRes.rows[0]!.active || paylinkRes.rows[0]!.deleted_at) {
-        await ensureMinimumTime(startTime, null);
+      if (!paylink || !paylink.active || paylink.deleted_at) {
         return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
       }
-
-      const paylink = paylinkRes.rows[0]!;
 
       // DB enforces these, but clamp anyway
       const safeLo = clampIndex(paylink.min_index);
@@ -612,18 +637,19 @@ async function main() {
 
       const index = crypto.randomInt(lo, hi + 1);
 
-      const viewKey = decryptViewKey(
-        paylink.encrypted_view_key,
-        paylink.encryption_nonce,
-      );
-      const decoded = decodeStandardAddress(paylink.public_address);
-
-      const address = subaddress.getSubaddress(
-        viewKey,
-        decoded.publicSpendKeyHex,
-        0,
-        index,
-      );
+      // The pool was derived and stored at creation time, so serving a donation
+      // is a primary-key lookup and this service holds no key material at all.
+      const address = await findSubaddress(client, id, index);
+      if (!address) {
+        // The row's stored range disagrees with the pool that was written for
+        // it, so the paylink cannot be served. Same opaque answer as a missing
+        // paylink rather than a distinguishable error.
+        req.log.error(
+          { subaddressIndex: index },
+          "paylink has no address at the requested index",
+        );
+        return reply.code(404).send(PAYLINK_UNAVAILABLE_ERROR);
+      }
 
       const uri = buildMoneroUri({
         address,
@@ -649,6 +675,11 @@ async function main() {
       client.release();
     }
   });
+
+  // Loading the Monero WASM module takes roughly 300ms. Do it before the port
+  // opens so the first real request doesn't wear that cost, and so a broken
+  // install fails at boot rather than on someone's donation.
+  await warmupMoneroAddressing();
 
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? "0.0.0.0";
