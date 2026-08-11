@@ -14,10 +14,25 @@ const MIGRATIONS_DIR = path.resolve(__dirname, "../../migrations");
 
 export type TestDb = Queryable & {
   close: () => Promise<void>;
+
+  /**
+   * Apply further migrations - the next `count`, or all that remain.
+   *
+   * This is what lets a test stand on an older schema, write rows the way that
+   * release wrote them, and then migrate forward over real data.
+   */
+  migrate: (count?: number) => Promise<void>;
 };
 
-/** A fresh, fully migrated database. Each call is completely isolated. */
-export async function createTestDb(): Promise<TestDb> {
+/**
+ * A fresh database. Each call is completely isolated.
+ *
+ * `upTo` stops after that many migrations instead of running them all, so a
+ * test can reproduce the schema a previous release was running.
+ */
+export async function createTestDb(
+  options: { upTo?: number } = {},
+): Promise<TestDb> {
   // Both packages are ESM-only and this file is CommonJS, so they are pulled
   // in dynamically rather than with a top-level import.
   const { PGlite } = await import("@electric-sql/pglite");
@@ -38,17 +53,23 @@ export async function createTestDb(): Promise<TestDb> {
     end: async () => {},
   };
 
-  await runner({
-    dbClient,
-    dir: MIGRATIONS_DIR,
-    direction: "up",
-    migrationsTable: "pgmigrations",
-    verbose: false,
-  });
+  const migrate = async (count?: number) => {
+    await runner({
+      dbClient,
+      dir: MIGRATIONS_DIR,
+      direction: "up",
+      migrationsTable: "pgmigrations",
+      verbose: false,
+      ...(count === undefined ? {} : { count }),
+    });
+  };
+
+  await migrate(options.upTo);
 
   return {
     query: (text: string, values?: unknown[]) =>
       pg.query(text, values as any[]) as any,
     close: () => pg.close(),
+    migrate,
   };
 }

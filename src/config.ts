@@ -25,6 +25,19 @@ export type AppConfig = {
   /** Null only outside production, where the fingerprint falls back to a hash. */
   fingerprintKey: string | null;
 
+  /**
+   * Secret mixed into an owner key before storing or comparing it.
+   *
+   * Without it, the stored column both groups a wallet's paylinks together and
+   * doubles as the delete credential. See src/ownerKey.ts.
+   *
+   * Null only outside production, like the fingerprint key.
+   *
+   * Losing it is unrecoverable: no owner could delete anything again. Back it
+   * up alongside PAYLINKS_FINGERPRINT_KEY.
+   */
+  ownerKeyPepper: string | null;
+
   trustProxy: TrustProxy;
 
   rateLimit: {
@@ -134,6 +147,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     fingerprintKey = keyRaw;
   }
 
+  const pepperRaw = env.PAYLINKS_OWNER_KEY_PEPPER;
+  let ownerKeyPepper: string | null = null;
+  if (!pepperRaw || pepperRaw.length < 16) {
+    if (isProduction) {
+      problems.push(
+        "PAYLINKS_OWNER_KEY_PEPPER must be set (>=16 chars) in production",
+      );
+    }
+  } else {
+    ownerKeyPepper = pepperRaw;
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -146,6 +171,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowNullOrigin: env.ALLOW_NULL_ORIGIN === "true",
     donateBaseUrl,
     fingerprintKey,
+    ownerKeyPepper,
 
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
 
@@ -155,14 +181,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // Reads are cheap, so the ceiling is generous.
       max: positiveInt(env, "RATE_LIMIT_MAX", 120),
 
-      // Creating a paylink derives its whole address pool: up to ~400ms of CPU
-      // and ~93KB at the cap, unauthenticated. On a hidden service, where an
-      // abuser cannot be identified or blocked, this is the only thing in front
-      // of that cost.
+      // Creating a paylink derives its whole address pool: measured at about
+      // 5s of work and 200KB at the cap. Sized against that cost.
       createMax: positiveInt(env, "RATE_LIMIT_CREATE_MAX", 20),
 
-      // Keyed per paylink, so one link cannot have its pool harvested. A
-      // donation page spends exactly one per visit.
+      // Keyed per paylink. A donation page spends exactly one per visit.
+      //
+      // Left at 60 deliberately. Behind a hidden service every caller shares
+      // one address, so this is a paylink's whole budget rather than a
+      // per-visitor one, and lowering it mostly costs availability: donors past
+      // the ceiling get a 429 on the page meant to show them an address.
       requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 60),
 
       // Destructive, and one request already does everything an owner needs.

@@ -4,7 +4,7 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { z } from "zod";
-import { pool } from "./db";
+import { createPool } from "./db";
 import { buildMoneroUri } from "./moneroUri";
 import {
   deletePaylinkByIdAndOwner,
@@ -14,13 +14,15 @@ import {
   findSubaddress,
   insertPaylink,
   insertSubaddresses,
+  type PoolLike,
 } from "./store";
 import {
   assertValidPrimaryAddressAndViewKey,
   deriveSubaddressRange,
   warmup as warmupMoneroAddressing,
 } from "./monero/address";
-import { loadConfig } from "./config";
+import { loadConfig, type AppConfig } from "./config";
+import { hashOwnerKey } from "./ownerKey";
 import crypto from "crypto";
 
 const MAX_SUBADDRESS_INDEX = 1_000_000;
@@ -29,9 +31,10 @@ const DEFAULT_MAX_INDEX = 100;
 
 // How many addresses a single paylink may reserve. Subaddresses are derived up
 // front so the view key never has to be stored, which turns the index range
-// into real work and storage: roughly 0.4ms and 95 bytes per address, so a
-// thousand costs about 400ms and 93KB. The donate page requests exactly one
-// address per visit, so this is a generous ceiling rather than a tight one.
+// into real work and storage: measured at about 4.8ms and 200 bytes per
+// address, so a thousand costs roughly 5s and 200KB. The donate page spends
+// exactly one address per visit, so this ceiling is generous rather than
+// tight. Derivation runs in a worker and does not hold the event loop.
 const MAX_POOL_SIZE = 1_000;
 
 // --- Schemas ---
@@ -188,10 +191,14 @@ function computeOwnerKey(publicAddress: string, privateViewKey: string) {
     .digest("hex");
 }
 
-async function main() {
-  // Before anything else, so a missing value stops the service here rather than
-  // part-way through someone's donation.
-  const config = loadConfig();
+/**
+ * Build the service without starting it.
+ *
+ * Config and the pool are passed in rather than reached for, so the tests can
+ * drive these exact handlers against an in-process database.
+ */
+export async function buildApp(deps: { config: AppConfig; pool: PoolLike }) {
+  const { config, pool } = deps;
 
   const app = Fastify({
     logger: {
@@ -315,6 +322,15 @@ async function main() {
 
   app.addHook("onRequest", async (req) => {
     if (isPaddedRoute(req)) requestStart.set(req, monotonicNowMs());
+  });
+
+  // Donation responses carry an address tied to a paylink id. There's no shared
+  // cache on a hidden service, but this is also meant to be self-hosted behind
+  // a normal reverse proxy, where caching is the default.
+  app.addHook("onSend", async (_req, reply, payload) => {
+    reply.header("cache-control", "no-store, no-cache, must-revalidate");
+    reply.header("pragma", "no-cache");
+    return payload;
   });
 
   app.addHook("onSend", async (req, _reply, payload) => {
@@ -520,7 +536,12 @@ async function main() {
       // Preview so the user can sanity-check the first address in their wallet.
       const addressPreview = previewAddr(subaddresses[0]!.address);
 
-      const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
+      // Peppered straight away, so what reaches the database is never the
+      // value a client could replay.
+      const ownerKeyHmac = hashOwnerKey(
+        computeOwnerKey(publicAddress, privateViewKey),
+        config.ownerKeyPepper,
+      );
 
       const client = await pool.connect();
       try {
@@ -533,7 +554,7 @@ async function main() {
           genMode,
           minIndex,
           maxIndex,
-          ownerKey,
+          ownerKeyHmac,
         });
 
         await insertSubaddresses(client, id, subaddresses);
@@ -609,8 +630,13 @@ async function main() {
       try {
         await client.query("BEGIN");
 
-        // Only deletes if BOTH match.
-        await deletePaylinkByIdAndOwner(client, id, ownerKey);
+        // Only deletes if BOTH match. We store the peppered form, so hash
+        // what the browser sent before comparing.
+        await deletePaylinkByIdAndOwner(
+          client,
+          id,
+          hashOwnerKey(ownerKey, config.ownerKeyPepper),
+        );
 
         await client.query("COMMIT");
 
@@ -656,7 +682,10 @@ async function main() {
       try {
         await client.query("BEGIN");
 
-        await deletePaylinksByOwner(client, ownerKey);
+        await deletePaylinksByOwner(
+          client,
+          hashOwnerKey(ownerKey, config.ownerKeyPepper),
+        );
 
         await client.query("COMMIT");
 
@@ -770,6 +799,16 @@ async function main() {
     },
   );
 
+  return app;
+}
+
+async function main() {
+  // Before anything else, so a missing value stops the service here rather than
+  // part-way through someone's donation.
+  const config = loadConfig();
+
+  const app = await buildApp({ config, pool: createPool() });
+
   // Loading the Monero WASM module takes roughly 300ms. Do it before the port
   // opens so the first real request doesn't wear that cost, and so a broken
   // install fails at boot rather than on someone's donation.
@@ -778,7 +817,11 @@ async function main() {
   await app.listen({ port: config.port, host: config.host });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only when this file is what was run. Importing it - which the route tests do
+// - should not open a database connection or a port.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

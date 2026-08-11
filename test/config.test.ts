@@ -11,6 +11,7 @@ function prodEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     ALLOWED_ORIGINS: "https://anonomi.org",
     DONATE_BASE_URL: "https://anonomi.org/paylinks/d#",
     PAYLINKS_FINGERPRINT_KEY: "k".repeat(32),
+    PAYLINKS_OWNER_KEY_PEPPER: "p".repeat(32),
     ...overrides,
   };
 }
@@ -40,6 +41,19 @@ test("a fingerprint key shorter than 16 chars is refused in production", () => {
   );
 });
 
+test("a production deployment with no owner key pepper refuses to start", () => {
+  const env = prodEnv();
+  delete env.PAYLINKS_OWNER_KEY_PEPPER;
+  assert.throws(() => loadConfig(env), ConfigError);
+});
+
+test("an owner key pepper shorter than 16 chars is refused in production", () => {
+  assert.throws(
+    () => loadConfig(prodEnv({ PAYLINKS_OWNER_KEY_PEPPER: "tooshort" })),
+    ConfigError,
+  );
+});
+
 test("a wildcard origin list is refused in production", () => {
   assert.throws(
     () => loadConfig(prodEnv({ ALLOWED_ORIGINS: "*" })),
@@ -59,10 +73,11 @@ test("every missing value is reported at once, not one per restart", () => {
     assert.fail("expected ConfigError");
   } catch (err) {
     assert.ok(err instanceof ConfigError);
-    assert.equal(err.problems.length, 3);
+    assert.equal(err.problems.length, 4);
     assert.match(err.message, /ALLOWED_ORIGINS/);
     assert.match(err.message, /DONATE_BASE_URL/);
     assert.match(err.message, /PAYLINKS_FINGERPRINT_KEY/);
+    assert.match(err.message, /PAYLINKS_OWNER_KEY_PEPPER/);
   }
 });
 
