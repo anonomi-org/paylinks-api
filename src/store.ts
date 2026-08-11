@@ -16,6 +16,14 @@ export interface Queryable {
   ): Promise<{ rows: R[]; rowCount?: number | null }>;
 }
 
+/** A client checked out of a pool, returned when the handler is done. */
+export type PooledClient = Queryable & { release(): void };
+
+/** Just enough of a pg Pool for the handlers, so tests can supply their own. */
+export interface PoolLike {
+  connect(): Promise<PooledClient>;
+}
+
 export type PaylinkMeta = {
   label: string | null;
   active: boolean;

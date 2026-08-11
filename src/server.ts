@@ -4,7 +4,7 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import "dotenv/config";
 import { z } from "zod";
-import { pool } from "./db";
+import { createPool } from "./db";
 import { buildMoneroUri } from "./moneroUri";
 import {
   deletePaylinkByIdAndOwner,
@@ -14,13 +14,14 @@ import {
   findSubaddress,
   insertPaylink,
   insertSubaddresses,
+  type PoolLike,
 } from "./store";
 import {
   assertValidPrimaryAddressAndViewKey,
   deriveSubaddressRange,
   warmup as warmupMoneroAddressing,
 } from "./monero/address";
-import { loadConfig } from "./config";
+import { loadConfig, type AppConfig } from "./config";
 import { hashOwnerKey } from "./ownerKey";
 import crypto from "crypto";
 
@@ -189,10 +190,14 @@ function computeOwnerKey(publicAddress: string, privateViewKey: string) {
     .digest("hex");
 }
 
-async function main() {
-  // Before anything else, so a missing value stops the service here rather than
-  // part-way through someone's donation.
-  const config = loadConfig();
+/**
+ * Build the service without starting it.
+ *
+ * Config and the pool are passed in rather than reached for, so the tests can
+ * drive these exact handlers against an in-process database.
+ */
+export async function buildApp(deps: { config: AppConfig; pool: PoolLike }) {
+  const { config, pool } = deps;
 
   const app = Fastify({
     logger: {
@@ -793,6 +798,16 @@ async function main() {
     },
   );
 
+  return app;
+}
+
+async function main() {
+  // Before anything else, so a missing value stops the service here rather than
+  // part-way through someone's donation.
+  const config = loadConfig();
+
+  const app = await buildApp({ config, pool: createPool() });
+
   // Loading the Monero WASM module takes roughly 300ms. Do it before the port
   // opens so the first real request doesn't wear that cost, and so a broken
   // install fails at boot rather than on someone's donation.
@@ -801,7 +816,11 @@ async function main() {
   await app.listen({ port: config.port, host: config.host });
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only when this file is what was run. Importing it - which the route tests do
+// - should not open a database connection or a port.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
