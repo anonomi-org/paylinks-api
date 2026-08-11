@@ -181,21 +181,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // Reads are cheap, so the ceiling is generous.
       max: positiveInt(env, "RATE_LIMIT_MAX", 120),
 
-      // Creating a paylink derives its whole address pool: up to ~400ms of CPU
-      // and ~93KB at the cap, unauthenticated. On a hidden service, where an
-      // abuser cannot be identified or blocked, this is the only thing in front
-      // of that cost.
+      // Creating a paylink derives its whole address pool: measured at about
+      // 5s of work and 200KB at the cap. Sized against that cost.
       createMax: positiveInt(env, "RATE_LIMIT_CREATE_MAX", 20),
 
-      // Keyed per paylink, so one link cannot have its pool harvested. A
-      // donation page spends exactly one per visit.
+      // Keyed per paylink. A donation page spends exactly one per visit.
       //
-      // Left at 60 deliberately. On Tor every caller shares one address, so
-      // this is a paylink's whole budget rather than a per-visitor one, and
-      // tightening it mostly costs availability: the donors past the ceiling
-      // get a 429 on the page meant to show them an address. It buys little
-      // against harvesting either way - draining a 100-address pool is minutes
-      // at any of these values. A larger pool is the lever for that, not this.
+      // Left at 60 deliberately. Behind a hidden service every caller shares
+      // one address, so this is a paylink's whole budget rather than a
+      // per-visitor one, and lowering it mostly costs availability: donors past
+      // the ceiling get a 429 on the page meant to show them an address.
       requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 60),
 
       // Destructive, and one request already does everything an owner needs.

@@ -1,9 +1,9 @@
 // Turns the owner key the browser sends into the value we store.
 //
-// The browser sends sha256("paylinks:ownerkey:v1:<address>:<viewKey>"). We used
-// to store that as-is, which meant one wallet's paylinks all shared a string,
-// and that string was itself the delete credential. Hashing it again with a
-// server-side secret fixes both, and the browser doesn't change.
+// The browser sends sha256("paylinks:ownerkey:v1:<address>:<viewKey>"). Hashing
+// that again with a server-side secret means the stored column is neither a
+// value that can be presented back to the API nor one that links a wallet's
+// paylinks together. What the browser sends does not change.
 //
 // Separate module because migration 004 has to use the exact same function.
 

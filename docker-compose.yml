@@ -61,15 +61,12 @@ services:
     environment:
       DATABASE_URL: postgres://paylinks:${POSTGRES_PASSWORD}@db:5432/paylinks
       # Migration 004 re-derives every stored owner key through this value, so
-      # it has to be the same one the api service above runs with. Migrating
-      # with a different pepper leaves every owner unable to delete, and the
-      # delete endpoints answer 200 either way, so nothing would report it.
+      # it has to be the same one the api service above runs with. A mismatch
+      # leaves owners unable to delete, and nothing surfaces it.
       PAYLINKS_OWNER_KEY_PEPPER: ${PAYLINKS_OWNER_KEY_PEPPER}
       # Hardcoded, like the api service above. Reading it from .env would pick
       # up the NODE_ENV=development that .env.example ships with, which turns
-      # the missing-pepper check off exactly where it matters: the migration
-      # would backfill unpeppered, mark itself done, and every existing paylink
-      # would be undeletable with nothing reporting it.
+      # off the check that the pepper is present.
       NODE_ENV: production
     command: ["npx", "node-pg-migrate", "up", "-m", "migrations"]
     networks:

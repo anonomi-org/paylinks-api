@@ -155,11 +155,9 @@ export async function findSubaddress(
  * with it through the foreign key's ON DELETE CASCADE.
  *
  * Matches on the peppered column only, so a row with a NULL owner_key_hmac
- * never matches. The backfill covers every pre-existing row, so the rows that
- * end up NULL are ones the previous release wrote after 004 ran - a rolling
- * deploy, or the compose migrate profile, which does not stop the api service.
- * Those paylinks cannot be deleted by anyone and the endpoint still answers
- * 200, which is why the migration is documented as needing the app stopped.
+ * never matches. The backfill covers every pre-existing row; a NULL is a row
+ * the previous release wrote after 004 ran, which is why the migration is
+ * documented as needing the app stopped.
  */
 export async function deletePaylinkByIdAndOwner(
   db: Queryable,

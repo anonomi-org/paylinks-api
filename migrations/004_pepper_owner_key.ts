@@ -5,9 +5,9 @@ import crypto from "crypto";
 /**
  * Stop storing a replayable owner key.
  *
- * owner_key held the exact value the delete endpoints accept, so reading the
- * table was enough to delete anyone's paylinks, and one wallet's rows all
- * shared a string that grouped them. Storing a peppered hash fixes both.
+ * Storing a peppered hash instead means the column is neither a value that can
+ * be presented back to the API nor one that links a wallet's rows together.
+ * See src/ownerKey.ts.
  *
  * Two-phase, like 003 did for public_address: this migration adds
  * owner_key_hmac, backfills it, and makes owner_key nullable so the new code
@@ -16,8 +16,8 @@ import crypto from "crypto";
  * old column keeps working until it's actually dropped.
  *
  * Needs PAYLINKS_OWNER_KEY_PEPPER, and it must match what the API runs with.
- * Backfill with one pepper and serve with another and nobody can delete
- * anything - silently, since delete always answers 200. Hence the check below.
+ * Backfilling with one value and serving with another leaves owners unable to
+ * delete, and nothing surfaces that. Hence the check below.
  *
  * Uses pgm.db rather than the pgm builders: the builders only queue SQL, which
  * runs after this function returns, so the backfill would be reading a column
