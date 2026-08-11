@@ -31,9 +31,21 @@ const DEFAULT_MAX_INDEX = 100;
 
 // How many addresses a single paylink may reserve. Subaddresses are derived up
 // front so the view key never has to be stored, which turns the index range
-// into real work and storage: roughly 0.4ms and 95 bytes per address, so a
-// thousand costs about 400ms and 93KB. The donate page requests exactly one
-// address per visit, so this is a generous ceiling rather than a tight one.
+// into real work and storage. Measured against Postgres 16, not estimated:
+// about 4.8ms and 200 bytes per address, so a thousand costs roughly 5s and
+// 200KB. The donate page spends exactly one address per visit, so this ceiling
+// is generous rather than tight.
+//
+// That makes create the one expensive unauthenticated call here, and on a
+// hidden service an abuser cannot be identified or blocked. At the default 20
+// creates a minute the ceiling is about 4MB a minute.
+//
+// Accepted as it stands. It takes a sustained deliberate attack to matter, it
+// exposes nothing and risks no funds, and derivation runs in a worker - a
+// 1000-address create leaves /health at its idle 10ms, so it never blocks the
+// event loop or slows a donation. Revisit if creation volume grows; a nullable
+// expiry column and a total row cap are the levers, and neither would touch
+// paylinks that already exist.
 const MAX_POOL_SIZE = 1_000;
 
 // --- Schemas ---
