@@ -1,6 +1,6 @@
-import type { MigrationBuilder } from "node-pg-migrate";
+import type { MigrationBuilder } from "node-pg-migrate" with { "resolution-mode": "import" };
 
-import { hashOwnerKey } from "../src/ownerKey";
+import crypto from "crypto";
 
 /**
  * Stop storing a replayable owner key.
@@ -24,14 +24,39 @@ import { hashOwnerKey } from "../src/ownerKey";
  * that doesn't exist yet. pgm.db runs immediately, in order, inside the
  * runner's transaction, and takes bound parameters.
  */
+
+/**
+ * Deliberately a copy of hashOwnerKey from src/ownerKey.ts, not an import.
+ *
+ * node-pg-migrate loads migrations with `await import("file://...")`, so an
+ * extensionless specifier does not resolve, and the production image contains
+ * dist and migrations but no src for it to reach anyway. Importing it made this
+ * migration unloadable by the actual migrate command while the tsx-driven test
+ * suite stayed green.
+ *
+ * The two must produce identical output forever - if they diverge, every
+ * migrated paylink becomes undeletable - so a test asserts they agree.
+ */
+export function hashOwnerKeyForMigration(
+  ownerKey: string,
+  pepper: string | null,
+): string {
+  if (!pepper) {
+    return crypto.createHash("sha256").update(ownerKey).digest("hex");
+  }
+  return crypto.createHmac("sha256", pepper).update(ownerKey).digest("hex");
+}
 export async function up(pgm: MigrationBuilder): Promise<void> {
-  const pepper = process.env.PAYLINKS_OWNER_KEY_PEPPER?.trim() || null;
+  // No trim, and the same >=16 rule loadConfig applies. Normalising
+  // differently here would mean the same .env produced two different keys.
+  const raw = process.env.PAYLINKS_OWNER_KEY_PEPPER;
+  const pepper = raw && raw.length >= 16 ? raw : null;
 
   if (process.env.NODE_ENV === "production" && !pepper) {
     throw new Error(
-      "PAYLINKS_OWNER_KEY_PEPPER must be set to run this migration in production. " +
-        "It has to match the value the API runs with, or no owner will be able " +
-        "to delete their paylinks.",
+      "PAYLINKS_OWNER_KEY_PEPPER must be set (>=16 chars) to run this migration " +
+        "in production. It has to match the value the API runs with, or no owner " +
+        "will be able to delete their paylinks.",
     );
   }
 
@@ -41,7 +66,7 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
   // pgcrypto plus a second implementation to keep in step, and 001 avoided
   // requiring that extension at all.
   const rows: { id: string; owner_key: string }[] = await pgm.db.select(
-    `SELECT id, owner_key FROM paylinks WHERE owner_key IS NOT NULL`,
+    `SELECT id, owner_key FROM paylinks WHERE owner_key IS NOT NULL AND owner_key <> ''`,
   );
 
   // unnest keeps this to two bound parameters per batch, the same way the
@@ -58,7 +83,7 @@ export async function up(pgm: MigrationBuilder): Promise<void> {
       `,
       [
         batch.map((r) => r.id),
-        batch.map((r) => hashOwnerKey(r.owner_key, pepper)),
+        batch.map((r) => hashOwnerKeyForMigration(r.owner_key, pepper)),
       ],
     );
   }

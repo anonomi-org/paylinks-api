@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import crypto from "crypto";
 
 import { hashOwnerKey } from "../src/ownerKey";
+import { hashOwnerKeyForMigration } from "../migrations/004_pepper_owner_key";
 
 const PEPPER = "a-pepper-of-sufficient-length";
 
@@ -27,6 +28,21 @@ test("the owner key format matches the one the browser computes", () => {
     browserOwnerKey(address, viewKey),
     "c0aeb3e6dcac211c53c560b8b950b815384ab8b61b7ef59be14067e796b8ade8",
   );
+});
+
+test("the migration's copy of the hash agrees with this one", () => {
+  // 004 cannot import from src - node-pg-migrate loads migrations as ESM and
+  // the production image has no src directory - so it carries its own copy.
+  // If these ever diverge, every migrated paylink becomes undeletable.
+  for (const pepper of [null, PEPPER, "y".repeat(40)]) {
+    for (const input of ["", "a".repeat(64), browserOwnerKey("addr", "key")]) {
+      assert.equal(
+        hashOwnerKeyForMigration(input, pepper),
+        hashOwnerKey(input, pepper),
+        `diverged for pepper=${pepper} input=${input.slice(0, 12)}`,
+      );
+    }
+  }
 });
 
 test("peppering produces something other than what was sent", () => {

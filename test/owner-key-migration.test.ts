@@ -97,7 +97,10 @@ test("migrating carries every existing paylink forward", async () => {
   const other = await insertLegacyPaylink(ownerKeyB);
   for (const id of [first, second, other]) await insertPool(id);
 
-  await db.migrate();
+  // Exactly one migration - 004. Left unbounded, the follow-up that drops
+  // owner_key would run here too and this test would be asserting against a
+  // column that no longer exists.
+  await db.migrate(1);
 
   // Every row still exists, and so does its address pool. This is the part a
   // recipient would notice immediately: their donate links keep working.

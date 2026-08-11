@@ -65,7 +65,12 @@ services:
       # with a different pepper leaves every owner unable to delete, and the
       # delete endpoints answer 200 either way, so nothing would report it.
       PAYLINKS_OWNER_KEY_PEPPER: ${PAYLINKS_OWNER_KEY_PEPPER}
-      NODE_ENV: ${NODE_ENV:-production}
+      # Hardcoded, like the api service above. Reading it from .env would pick
+      # up the NODE_ENV=development that .env.example ships with, which turns
+      # the missing-pepper check off exactly where it matters: the migration
+      # would backfill unpeppered, mark itself done, and every existing paylink
+      # would be undeletable with nothing reporting it.
+      NODE_ENV: production
     command: ["npx", "node-pg-migrate", "up", "-m", "migrations"]
     networks:
       - paylinks_net

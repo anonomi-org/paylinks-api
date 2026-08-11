@@ -11,8 +11,12 @@ function positiveInt(name: string, fallback: number): number {
  * TLS to the database.
  *
  * Off by default: in the compose file Postgres is on a private network and
- * never published. That stops being true the moment DATABASE_URL points
- * elsewhere, and pg would switch silently, so make it a setting.
+ * never published.
+ *
+ * This is only the default. pg merges the parsed connection string over the
+ * config it is given, so any sslmode/ssl/sslcert in DATABASE_URL wins over
+ * this - `?ssl=0` connects in plaintext with DATABASE_SSL=true, and
+ * `?sslmode=require` enables TLS with it unset. The URL is authoritative.
  */
 function ssl(): { rejectUnauthorized: boolean } | false {
   if (process.env.DATABASE_SSL !== "true") return false;
