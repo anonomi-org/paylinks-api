@@ -81,9 +81,18 @@ regenerated and audited.
    # Fingerprint HMAC key
    openssl rand -hex 32
 
+   # Owner key pepper
+   openssl rand -hex 32
+
    # Database password
    openssl rand -hex 16
    ```
+
+   Back up `PAYLINKS_OWNER_KEY_PEPPER` somewhere you would not lose it. Every
+   stored owner key is derived from it, so if it changes, nobody can delete a
+   paylink again — and since the delete endpoints always answer 200, nothing
+   reports that. The migration and the app must run with the same value; both
+   read it from `.env`, so run them from the same directory.
 
 3. Run migrations:
    ```bash

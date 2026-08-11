@@ -21,6 +21,7 @@ import {
   warmup as warmupMoneroAddressing,
 } from "./monero/address";
 import { loadConfig } from "./config";
+import { hashOwnerKey } from "./ownerKey";
 import crypto from "crypto";
 
 const MAX_SUBADDRESS_INDEX = 1_000_000;
@@ -317,6 +318,15 @@ async function main() {
     if (isPaddedRoute(req)) requestStart.set(req, monotonicNowMs());
   });
 
+  // Donation responses carry an address tied to a paylink id. There's no shared
+  // cache on a hidden service, but this is also meant to be self-hosted behind
+  // a normal reverse proxy, where caching is the default.
+  app.addHook("onSend", async (_req, reply, payload) => {
+    reply.header("cache-control", "no-store, no-cache, must-revalidate");
+    reply.header("pragma", "no-cache");
+    return payload;
+  });
+
   app.addHook("onSend", async (req, _reply, payload) => {
     const startedAt = requestStart.get(req);
     if (startedAt !== undefined) await padToFloor(startedAt);
@@ -520,7 +530,12 @@ async function main() {
       // Preview so the user can sanity-check the first address in their wallet.
       const addressPreview = previewAddr(subaddresses[0]!.address);
 
-      const ownerKey = computeOwnerKey(publicAddress, privateViewKey);
+      // Peppered straight away, so what reaches the database is never the
+      // value a client could replay.
+      const ownerKeyHmac = hashOwnerKey(
+        computeOwnerKey(publicAddress, privateViewKey),
+        config.ownerKeyPepper,
+      );
 
       const client = await pool.connect();
       try {
@@ -533,7 +548,7 @@ async function main() {
           genMode,
           minIndex,
           maxIndex,
-          ownerKey,
+          ownerKeyHmac,
         });
 
         await insertSubaddresses(client, id, subaddresses);
@@ -609,8 +624,13 @@ async function main() {
       try {
         await client.query("BEGIN");
 
-        // Only deletes if BOTH match.
-        await deletePaylinkByIdAndOwner(client, id, ownerKey);
+        // Only deletes if BOTH match. We store the peppered form, so hash
+        // what the browser sent before comparing.
+        await deletePaylinkByIdAndOwner(
+          client,
+          id,
+          hashOwnerKey(ownerKey, config.ownerKeyPepper),
+        );
 
         await client.query("COMMIT");
 
@@ -656,7 +676,10 @@ async function main() {
       try {
         await client.query("BEGIN");
 
-        await deletePaylinksByOwner(client, ownerKey);
+        await deletePaylinksByOwner(
+          client,
+          hashOwnerKey(ownerKey, config.ownerKeyPepper),
+        );
 
         await client.query("COMMIT");
 

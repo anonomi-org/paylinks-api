@@ -13,6 +13,7 @@ services:
       HOST: 0.0.0.0
       DATABASE_URL: postgres://paylinks:${POSTGRES_PASSWORD}@db:5432/paylinks
       PAYLINKS_FINGERPRINT_KEY: ${PAYLINKS_FINGERPRINT_KEY}
+      PAYLINKS_OWNER_KEY_PEPPER: ${PAYLINKS_OWNER_KEY_PEPPER}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       ALLOW_NULL_ORIGIN: ${ALLOW_NULL_ORIGIN:-false}
       DONATE_BASE_URL: ${DONATE_BASE_URL}
@@ -59,6 +60,12 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://paylinks:${POSTGRES_PASSWORD}@db:5432/paylinks
+      # Migration 004 re-derives every stored owner key through this value, so
+      # it has to be the same one the api service above runs with. Migrating
+      # with a different pepper leaves every owner unable to delete, and the
+      # delete endpoints answer 200 either way, so nothing would report it.
+      PAYLINKS_OWNER_KEY_PEPPER: ${PAYLINKS_OWNER_KEY_PEPPER}
+      NODE_ENV: ${NODE_ENV:-production}
     command: ["npx", "node-pg-migrate", "up", "-m", "migrations"]
     networks:
       - paylinks_net

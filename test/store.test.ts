@@ -20,7 +20,11 @@ before(async () => {
 });
 
 after(async () => {
-  await db.close();
+  // Guarded because `before` may not have got as far as assigning it - a
+  // half-installed checkout, for one. Without this, that single failure is
+  // reported again for every test in the file as "cannot read close of
+  // undefined", which buries the one error that actually explains it.
+  await db?.close();
 });
 
 const OWNER_A = "a".repeat(64);
@@ -32,7 +36,7 @@ function paylink(overrides: Partial<NewPaylink> = {}): NewPaylink {
     genMode: "random",
     minIndex: 1,
     maxIndex: 10,
-    ownerKey: OWNER_A,
+    ownerKeyHmac: OWNER_A,
     ...overrides,
   };
 }
@@ -100,7 +104,7 @@ test("writes a whole address pool in one statement", async () => {
 
 test("keeps each paylink's pool separate", async () => {
   const a = await insertPaylink(db, paylink());
-  const b = await insertPaylink(db, paylink({ ownerKey: OWNER_B }));
+  const b = await insertPaylink(db, paylink({ ownerKeyHmac: OWNER_B }));
   await insertSubaddresses(db, a, pool(1, 10));
   await insertSubaddresses(db, b, pool(1, 10));
 
@@ -173,9 +177,9 @@ test("the right owner key deletes the paylink and its whole pool", async () => {
 });
 
 test("bulk delete removes every paylink for an owner, and no others", async () => {
-  const mine1 = await insertPaylink(db, paylink({ ownerKey: OWNER_A }));
-  const mine2 = await insertPaylink(db, paylink({ ownerKey: OWNER_A }));
-  const theirs = await insertPaylink(db, paylink({ ownerKey: OWNER_B }));
+  const mine1 = await insertPaylink(db, paylink({ ownerKeyHmac: OWNER_A }));
+  const mine2 = await insertPaylink(db, paylink({ ownerKeyHmac: OWNER_A }));
+  const theirs = await insertPaylink(db, paylink({ ownerKeyHmac: OWNER_B }));
   for (const id of [mine1, mine2, theirs]) {
     await insertSubaddresses(db, id, pool(1, 10));
   }

@@ -31,13 +31,17 @@ export type PaylinkForRequest = PaylinkMeta & {
 /**
  * No public address here on purpose. It is used to derive the pool and compute
  * the owner key, both before this row is written, and nothing reads it after.
+ *
+ * `ownerKeyHmac` is the peppered form from src/ownerKey.ts, never the value the
+ * browser sent. The plain owner_key column is left NULL: it still exists so the
+ * previous release keeps working, and a later migration drops it.
  */
 export type NewPaylink = {
   label: string | null;
   genMode: string;
   minIndex: number;
   maxIndex: number;
-  ownerKey: string;
+  ownerKeyHmac: string;
 };
 
 /** Insert the paylink row and return its generated id. */
@@ -52,12 +56,12 @@ export async function insertPaylink(
       gen_mode,
       min_index,
       max_index,
-      owner_key
+      owner_key_hmac
     )
     VALUES ($1,$2,$3,$4,$5)
     RETURNING id
     `,
-    [p.label, p.genMode, p.minIndex, p.maxIndex, p.ownerKey],
+    [p.label, p.genMode, p.minIndex, p.maxIndex, p.ownerKeyHmac],
   );
 
   const id = res.rows[0]?.id;
@@ -141,31 +145,35 @@ export async function findSubaddress(
 /**
  * Delete one paylink, and only if the owner key matches. The address pool goes
  * with it through the foreign key's ON DELETE CASCADE.
+ *
+ * Matches on the peppered column only. A row whose owner_key_hmac is NULL was
+ * written before migration 004 backfilled it and simply will not match, which
+ * is the safe direction: nothing is deleted that should not be.
  */
 export async function deletePaylinkByIdAndOwner(
   db: Queryable,
   id: string,
-  ownerKey: string,
+  ownerKeyHmac: string,
 ): Promise<void> {
   await db.query(
     `
     DELETE FROM paylinks
-    WHERE id = $1 AND owner_key = $2
+    WHERE id = $1 AND owner_key_hmac = $2
     `,
-    [id, ownerKey],
+    [id, ownerKeyHmac],
   );
 }
 
 /** Delete every paylink belonging to an owner key. */
 export async function deletePaylinksByOwner(
   db: Queryable,
-  ownerKey: string,
+  ownerKeyHmac: string,
 ): Promise<void> {
   await db.query(
     `
     DELETE FROM paylinks
-    WHERE owner_key = $1
+    WHERE owner_key_hmac = $1
     `,
-    [ownerKey],
+    [ownerKeyHmac],
   );
 }

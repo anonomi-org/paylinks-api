@@ -25,6 +25,19 @@ export type AppConfig = {
   /** Null only outside production, where the fingerprint falls back to a hash. */
   fingerprintKey: string | null;
 
+  /**
+   * Secret mixed into an owner key before storing or comparing it.
+   *
+   * Without it, the stored column both groups a wallet's paylinks together and
+   * doubles as the delete credential. See src/ownerKey.ts.
+   *
+   * Null only outside production, like the fingerprint key.
+   *
+   * Losing it is unrecoverable: no owner could delete anything again. Back it
+   * up alongside PAYLINKS_FINGERPRINT_KEY.
+   */
+  ownerKeyPepper: string | null;
+
   trustProxy: TrustProxy;
 
   rateLimit: {
@@ -134,6 +147,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     fingerprintKey = keyRaw;
   }
 
+  const pepperRaw = env.PAYLINKS_OWNER_KEY_PEPPER;
+  let ownerKeyPepper: string | null = null;
+  if (!pepperRaw || pepperRaw.length < 16) {
+    if (isProduction) {
+      problems.push(
+        "PAYLINKS_OWNER_KEY_PEPPER must be set (>=16 chars) in production",
+      );
+    }
+  } else {
+    ownerKeyPepper = pepperRaw;
+  }
+
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -146,6 +171,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowNullOrigin: env.ALLOW_NULL_ORIGIN === "true",
     donateBaseUrl,
     fingerprintKey,
+    ownerKeyPepper,
 
     trustProxy: parseTrustProxy(env.TRUST_PROXY),
 
@@ -163,7 +189,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
       // Keyed per paylink, so one link cannot have its pool harvested. A
       // donation page spends exactly one per visit.
-      requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 60),
+      //
+      // Lowered from 60. On Tor every caller shares one address, so this is the
+      // whole budget for a paylink, and 60/min drained a 100-address pool in
+      // under two minutes. The addresses alone reveal no payments - that needs
+      // the view key, which we don't hold - but they do let someone match a
+      // paylink against an address seen elsewhere. Still far above real use.
+      requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 15),
 
       // Destructive, and one request already does everything an owner needs.
       deleteMax: positiveInt(env, "RATE_LIMIT_DELETE_MAX", 20),
