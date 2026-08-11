@@ -190,12 +190,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       // Keyed per paylink, so one link cannot have its pool harvested. A
       // donation page spends exactly one per visit.
       //
-      // Lowered from 60. On Tor every caller shares one address, so this is the
-      // whole budget for a paylink, and 60/min drained a 100-address pool in
-      // under two minutes. The addresses alone reveal no payments - that needs
-      // the view key, which we don't hold - but they do let someone match a
-      // paylink against an address seen elsewhere. Still far above real use.
-      requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 15),
+      // Left at 60 deliberately. On Tor every caller shares one address, so
+      // this is a paylink's whole budget rather than a per-visitor one, and
+      // tightening it mostly costs availability: the donors past the ceiling
+      // get a 429 on the page meant to show them an address. It buys little
+      // against harvesting either way - draining a 100-address pool is minutes
+      // at any of these values. A larger pool is the lever for that, not this.
+      requestMax: positiveInt(env, "RATE_LIMIT_REQUEST_MAX", 60),
 
       // Destructive, and one request already does everything an owner needs.
       deleteMax: positiveInt(env, "RATE_LIMIT_DELETE_MAX", 20),
